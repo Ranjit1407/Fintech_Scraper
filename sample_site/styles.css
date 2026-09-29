@@ -1,0 +1,20 @@
+:root { --ink: #1d2433; --muted: #5b6475; --line: #dfe3ea; --brand: #0f5e9c; --bg: #f7f8fa; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); background: var(--bg); }
+header.site { background: #fff; border-bottom: 1px solid var(--line); }
+header.site .wrap { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.logo { font-weight: 700; color: var(--brand); text-decoration: none; font-size: 1.15rem; }
+nav a { color: var(--ink); text-decoration: none; margin-left: 16px; }
+nav a:hover { color: var(--brand); }
+.wrap { max-width: 980px; margin: 0 auto; padding: 16px; }
+.notice { background: #fff7e0; border: 1px solid #f0d58a; padding: 10px 14px; border-radius: 6px; font-size: .92rem; }
+main h1 { margin-top: 8px; }
+.product { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 4px 20px 12px; margin: 18px 0; }
+.product h2 { color: var(--brand); }
+table { width: 100%; border-collapse: collapse; background: #fff; margin: 12px 0 24px; }
+th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+th { background: #eef2f7; }
+.fine { color: var(--muted); font-size: .9rem; }
+footer.site { border-top: 1px solid var(--line); background: #fff; margin-top: 32px; }
+footer.site a { color: var(--muted); margin-right: 16px; }
+@media (max-width: 640px) { nav a { margin: 0 12px 0 0; } table { font-size: .9rem; } }

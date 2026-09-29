@@ -1,0 +1,26 @@
+NORTHWIND PAY DIGITAL WALLET
+
+Sample document: Northwind Community Bank is fictional and all figures are invented for testing. Not financial advice.
+
+Northwind Pay is a digital wallet for sending money to friends and paying in stores with your phone.
+
+FEES
+
+- Standard transfers to a bank account (1-3 business days): free
+- Instant transfers to a debit card: 1.5% of the amount (minimum $0.25, maximum $15)
+- International transfers: $4.99 per transfer plus a 1% currency conversion fee
+- Card payments in stores: free
+
+LIMITS
+
+- Daily sending limit: $2,500
+- Monthly sending limit: $10,000
+- Verified accounts can raise the daily limit to $5,000
+
+ELIGIBILITY
+
+You must be 18 or older, live in the United States and link a Northwind debit card or checking account.
+
+SUPPORT
+
+Questions about Northwind Pay: pay-support@northwind-sample.test

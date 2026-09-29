@@ -1,0 +1,77 @@
+# LLM configuration: models and generation parameters.
+#
+# No secrets here. API keys go in .env (git-ignored) or real environment variables:
+#   OPENROUTER_API_KEY=sk-or-...
+# Keys found in this file are rejected at startup.
+#
+# Select a profile with active_profile below, LLM_PROFILE in .env, `--profile` on the CLI,
+# or the "Model" option in the dashboard.
+#
+# Free OpenRouter models change over time; the current list is at
+# https://openrouter.ai/models?max_price=0 (pick ones that support "response_format").
+
+active_profile = "ollama-local"
+
+# Retrieval-augmented generation for sources longer than one prompt (max_input_chars):
+# every part is read for products and notes, and the summary is written from those notes plus
+# the passages most relevant to each report question.
+[rag]
+chunk_chars = 1500                 # size of each indexed chunk
+top_k = 3                          # passages retrieved per report question
+embedding_provider = "ollama"      # ollama | tfidf (tfidf needs no model; also the fallback)
+embedding_model = "bge-m3"         # run: ollama pull bge-m3
+embedding_base_url = "http://localhost:11434"
+embedding_timeout = 180
+
+# Applied to every profile unless the profile sets its own value.
+[defaults]
+temperature = 0.0        # deterministic output; keeps the model close to the source text
+top_p = 1.0
+max_tokens = 4096        # per response
+seed = 42                # honoured by providers that support it
+json_mode = true         # ask for a JSON object; retried without it if the model rejects the option
+timeout = 180            # seconds per request (free models can queue)
+max_input_chars = 15000  # source text sent per prompt
+num_ctx = 16384          # Ollama only: context window in tokens
+
+[profiles.gemma-4-31b]
+description = "Google Gemma 4 31B (free, OpenRouter)"
+provider = "openrouter"
+model = "google/gemma-4-31b-it:free"
+fallback_models = ["qwen/qwen3.8-27b:free", "google/gemma-4-26b-a4b-it:free"]
+
+[profiles.nemotron-120b]
+description = "NVIDIA Nemotron 3 Super 120B, 12B active (free, OpenRouter)"
+provider = "openrouter"
+model = "nvidia/nemotron-3-super-120b-a12b:free"
+fallback_models = ["google/gemma-4-31b-it:free"]
+max_input_chars = 30000
+
+[profiles.qwen-27b]
+description = "Qwen 3.8 27B (free, OpenRouter)"
+provider = "openrouter"
+model = "qwen/qwen3.8-27b:free"
+fallback_models = ["google/gemma-4-31b-it:free"]
+
+[profiles.gemma-4-26b-moe]
+description = "Google Gemma 4 26B mixture-of-experts, 4B active (free, OpenRouter)"
+provider = "openrouter"
+model = "google/gemma-4-26b-a4b-it:free"
+fallback_models = ["google/gemma-4-31b-it:free"]
+
+[profiles.lfm-2b]
+description = "Liquid LFM 2.5 2.6B, small model (free, OpenRouter); expect more facts removed by grounding"
+provider = "openrouter"
+model = "liquid/lfm-2.5-2.6b:free"
+max_input_chars = 8000
+
+[profiles.ollama-local]
+description = "Local model through Ollama (no key; run: ollama pull qwen2.5:7b)"
+provider = "ollama"
+model = "qwen2.5:7b"
+base_url = "http://localhost:11434"
+timeout = 300
+
+[profiles.rules-only]
+description = "No LLM: rule-based extraction only"
+provider = "none"
