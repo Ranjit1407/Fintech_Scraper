@@ -1,6 +1,6 @@
-# LLMs (small local ones especially) invent figures or move a fee from one product to another, so
-# every numeric fact must appear in the part of the source about *that* product: its section, table
-# row or JSON-LD entry. Facts that don't are removed, listed in `unverified`, and lower the confidence.
+# LLMs (small local ones especially) invent values or attach a fact to the wrong item, so every
+# attribute must be supported by the part of the source about *that* item: its section, table row or
+# JSON-LD entry. Facts that aren't are removed, listed in `unverified`, and lower the confidence.
 
 from __future__ import annotations
 
@@ -9,18 +9,17 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from app.scraper.parser import ParsedPage, find_financial_figures
-from app.validation.schemas import PageReport, parse_number
+from app.scraper.parser import ParsedPage, find_figures
+from app.validation.schemas import PageReport, clean_attributes, clean_text, parse_number
 
 NUMBER_RE = re.compile(r"(?<![\d.,])\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|(?<![\d.,])\d+(?:\.\d+)?")
-ZERO_WORDS = re.compile(r"\b(no|free|nil|zero|waived)\b", re.IGNORECASE)
+ZERO_WORDS = re.compile(r"\b(no|free|nil|zero|waived|none)\b", re.IGNORECASE)
 MAX_LLM_CONFIDENCE = 0.95
-
+MIN_WORD_OVERLAP = 0.5
 
 STOPWORDS = {
     "the", "and", "for", "with", "from", "your", "you", "this", "that", "are", "our", "all", "any", "not",
     "can", "has", "have", "will", "per", "into", "on", "of", "to", "in", "a", "an", "or", "is", "be", "by", "at",
-    "card", "account", "product",
 }
 
 
@@ -31,7 +30,7 @@ def _words(text: str) -> set[str]:
 
 def numbers_in(text: str) -> set[float]:
     numbers = {round(float(m.group().replace(",", "")), 4) for m in NUMBER_RE.finditer(text)}
-    numbers |= {round(f.value, 4) for f in find_financial_figures(text, limit=1000)}  # "$25k" -> 25000
+    numbers |= {round(f.value, 4) for f in find_figures(text, limit=1000)}  # "$25k" -> 25000
     return numbers
 
 
@@ -54,6 +53,7 @@ def _name_pattern(name: str) -> re.Pattern[str] | None:
 class PageEvidence:
     segments: list[str]  # sections, table rows, JSON-LD items, title/description
     numbers: set[float]
+    words: set[str]
 
     @classmethod
     def from_page(cls, page: ParsedPage) -> PageEvidence:
@@ -61,7 +61,8 @@ class PageEvidence:
         segments += [f"{s.heading or ''}\n{s.text}" for s in page.sections]
         segments += [" | ".join(f"{k}: {v}" for k, v in row.items() if v) for t in page.tables for row in t.rows]
         segments += [json.dumps(item, ensure_ascii=False) for item in page.json_ld]
-        return cls(segments=segments, numbers=numbers_in("\n".join(segments)))
+        text = "\n".join(segments)
+        return cls(segments=segments, numbers=numbers_in(text), words=_words(text))
 
     def context_for(self, name: str) -> str | None:
         exact = name.lower().strip()
@@ -71,97 +72,60 @@ class PageEvidence:
         return "\n".join(matches) if matches else None
 
 
-def ground_product(product: dict[str, Any], evidence: PageEvidence) -> dict[str, Any]:
-    name = str(product.get("name") or "")
-    context = evidence.context_for(name)
-    local = numbers_in(context) if context else evidence.numbers
-    zero_ok = bool(ZERO_WORDS.search(context or "")) or _contains(local, 0)
+def ground_item(item: dict[str, Any], evidence: PageEvidence) -> dict[str, Any]:
+    context = evidence.context_for(str(item.get("name") or ""))
+    numbers = numbers_in(context) if context else evidence.numbers
+    words = _words(context) if context else evidence.words
+    zero_ok = bool(ZERO_WORDS.search(context or "")) or _contains(numbers, 0)
+
+    def numbers_supported(text: str) -> bool:
+        return all(zero_ok if n == 0 else _contains(numbers, n) for n in numbers_in(text))
+
+    def supported(text: str) -> bool:
+        if numbers_in(text):
+            return numbers_supported(text)
+        text_words = _words(text)
+        return not text_words or len(text_words & words) / len(text_words) >= MIN_WORD_OVERLAP
+
     unverified: list[str] = []
     checked = verified = 0
-
-    def supported(value: float) -> bool:
-        return zero_ok if value == 0 else _contains(local, value)
-
-    rates = []
-    for rate in product.get("rates") or []:
-        values = [parse_number(rate.get(k)) for k in ("value", "min", "max")] if isinstance(rate, dict) else []
-        values = [v for v in values if v is not None]
-        if not values:
-            rates.append(rate)  # validation decides
-            continue
-        checked += 1
-        if all(supported(v) for v in values):
-            verified += 1
-            rates.append(rate)
-        else:
-            unverified.append(f"{rate.get('label') or 'Rate'}: {', '.join(f'{v:g}%' for v in values)}")
-    product["rates"] = rates
-
-    fees = []
-    for fee in product.get("fees") or []:
-        if not isinstance(fee, dict):
-            fees.append(fee)
-            continue
-        values = [v for v in (parse_number(fee.get("amount")), parse_number(fee.get("percentage"))) if v is not None]
-        if not values:
-            fees.append(fee)
-            continue
-        checked += 1
-        if all(supported(v) for v in values):
-            verified += 1
-            fees.append(fee)
-        else:
-            unverified.append(f"{fee.get('label') or 'Fee'}: {', '.join(f'{v:g}' for v in values)}")
-    product["fees"] = fees
-
-    # Text facts must share most of their meaningful words with this product's part of the page
-    if context is not None:
-        context_words = _words(context)
-        for key, label in (("features", "feature"), ("eligibility", "eligibility"), ("conditions", "condition")):
-            items = product.get(key)
-            if not isinstance(items, list):
-                continue
-            kept_items = []
-            for item in items:
-                words = _words(str(item))
-                if not words or len(words & context_words) / len(words) >= 0.5:
-                    kept_items.append(item)
-                else:
-                    unverified.append(f"{label}: {item}")
-            product[key] = kept_items
-
-    for key in ("min_amount", "max_amount"):
-        value = parse_number(product.get(key))
-        if value is None:
-            continue
+    attributes = {}
+    for label, value in clean_attributes(item.get("attributes")).items():
         checked += 1
         if supported(value):
             verified += 1
+            attributes[label] = value
         else:
-            unverified.append(f"{key.replace('_', ' ')}: {value:g}")
-            product[key] = None
+            unverified.append(f"{label}: {value}")
+    item["attributes"] = attributes
 
-    confidence = parse_number(product.get("confidence"))
+    # A description is the model's own sentence, so only the figures it quotes are checked.
+    description = clean_text(item.get("description"))
+    if description and not numbers_supported(description):
+        unverified.append(f"description: {description}")
+        item["description"] = None
+
+    confidence = parse_number(item.get("confidence"))
     confidence = min(confidence if confidence is not None and confidence <= 1 else 0.5, MAX_LLM_CONFIDENCE)
     if checked:
         confidence *= 0.5 + 0.5 * verified / checked
     if context is None:
         confidence *= 0.7
-        unverified.append("product name not found on the page")
-    product["confidence"] = round(confidence, 3)
-    product["unverified"] = unverified
-    return product
+        unverified.append("name not found in the source")
+    item["confidence"] = round(confidence, 3)
+    item["unverified"] = unverified
+    return item
 
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
 
 def _supported(text: str, evidence: PageEvidence) -> bool:
-    return all(_contains(evidence.numbers, f.value) or f.value == 0 for f in find_financial_figures(text))
+    return all(_contains(evidence.numbers, f.value) or f.value == 0 for f in find_figures(text))
 
 
 def ground_report(report: PageReport, evidence: PageEvidence) -> tuple[PageReport, int]:
-    """Report text isn't tied to one product, so a number only has to appear anywhere in the source."""
+    """Report text isn't tied to one item, so a number only has to appear anywhere in the source."""
     removed = 0
 
     def keep(items: list, text_of=lambda item: item) -> list:
@@ -179,9 +143,7 @@ def ground_report(report: PageReport, evidence: PageEvidence) -> tuple[PageRepor
         return "\n\n".join(paragraphs)
 
     updates: dict[str, object] = {
-        key: keep(getattr(report, key))
-        for key in ("key_points", "products_overview", "rates_and_fees", "eligibility_and_conditions",
-                    "things_to_watch")
+        key: keep(getattr(report, key)) for key in ("key_points", "items_overview", "things_to_watch")
     }
     updates["detailed_summary"] = keep_sentences(report.detailed_summary)
     sections = []
@@ -194,4 +156,8 @@ def ground_report(report: PageReport, evidence: PageEvidence) -> tuple[PageRepor
     removed += len(report.key_figures) - len(figures)
     updates["key_figures"] = figures
     updates["part_notes"] = [keep(notes) for notes in report.part_notes]
+    updates["keyword_findings"] = [
+        finding.model_copy(update={"summary": keep_sentences(finding.summary), "points": keep(finding.points)})
+        for finding in report.keyword_findings
+    ]
     return report.model_copy(update=updates), removed

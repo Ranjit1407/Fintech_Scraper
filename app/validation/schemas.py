@@ -1,5 +1,5 @@
-# LLM output is messy ("19.99%", "high", "credit_card", nested objects), so the product schemas
-# coerce what they safely can and reject what they cannot.
+# LLM output is messy ("85%", "high", nested objects, lists where a string was asked for), so the
+# schemas coerce what they safely can and reject what they cannot.
 
 from __future__ import annotations
 
@@ -19,27 +19,11 @@ from pydantic import (
     HttpUrl,
     ValidationError,
     field_validator,
-    model_validator,
 )
 
 
-class ProductCategory(str, Enum):
-    LOAN = "Loan"
-    CREDIT_CARD = "Credit Card"
-    INSURANCE = "Insurance"
-    INVESTMENT = "Investment"
-    BANKING = "Banking"
-    PAYMENT = "Payment"
-    OTHER = "Other"
-
-
 class DataType(str, Enum):
-    RATES = "rates"
-    FEES = "fees"
-    AMOUNTS = "amounts"
-    ELIGIBILITY = "eligibility"
-    FEATURES = "features"
-    CONDITIONS = "conditions"
+    ITEMS = "items"
     TABLES = "tables"
     TEXT = "text"
     METADATA = "metadata"
@@ -58,40 +42,6 @@ class CheckStatus(str, Enum):
     WARN = "warn"
     FAIL = "fail"
     SKIPPED = "skipped"
-
-
-_CATEGORY_ALIASES: dict[str, ProductCategory] = {
-    "loans": ProductCategory.LOAN,
-    "lending": ProductCategory.LOAN,
-    "mortgage": ProductCategory.LOAN,
-    "mortgages": ProductCategory.LOAN,
-    "credit cards": ProductCategory.CREDIT_CARD,
-    "creditcard": ProductCategory.CREDIT_CARD,
-    "card": ProductCategory.CREDIT_CARD,
-    "cards": ProductCategory.CREDIT_CARD,
-    "investments": ProductCategory.INVESTMENT,
-    "wealth": ProductCategory.INVESTMENT,
-    "bank": ProductCategory.BANKING,
-    "bank account": ProductCategory.BANKING,
-    "savings": ProductCategory.BANKING,
-    "deposit": ProductCategory.BANKING,
-    "deposits": ProductCategory.BANKING,
-    "account": ProductCategory.BANKING,
-    "payments": ProductCategory.PAYMENT,
-    "wallet": ProductCategory.PAYMENT,
-}
-
-
-def coerce_category(value: Any) -> ProductCategory | None:
-    if value is None:
-        return None
-    if isinstance(value, ProductCategory):
-        return value
-    key = re.sub(r"[\s_-]+", " ", str(value)).strip().lower()
-    for category in ProductCategory:
-        if category.value.lower() == key:
-            return category
-    return _CATEGORY_ALIASES.get(key)
 
 
 _MULTIPLIERS = {
@@ -121,21 +71,6 @@ def parse_number(value: Any) -> float | None:
     return number
 
 
-_CURRENCY_SYMBOLS = {
-    "$": "USD", "US$": "USD", "€": "EUR", "£": "GBP", "₹": "INR", "RS": "INR", "RS.": "INR",
-    "¥": "JPY", "A$": "AUD", "C$": "CAD", "S$": "SGD",
-}
-
-
-def normalize_currency(value: Any) -> str | None:
-    if not value:
-        return None
-    text = str(value).strip().upper()
-    if text in _CURRENCY_SYMBOLS:
-        return _CURRENCY_SYMBOLS[text]
-    return text if re.fullmatch(r"[A-Z]{3}", text) else None
-
-
 _CONFIDENCE_WORDS = {"very high": 0.95, "high": 0.9, "medium": 0.6, "moderate": 0.6, "low": 0.3, "very low": 0.1}
 
 
@@ -154,7 +89,7 @@ def _coerce_confidence(value: Any) -> Any:
     return value
 
 
-def _clean_optional_str(value: Any) -> str | None:
+def clean_text(value: Any) -> str | None:
     if value is None:
         return None
     if isinstance(value, (list, tuple)):
@@ -173,209 +108,98 @@ def _clean_str_list(value: Any) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for item in value:
-        text = _clean_optional_str(item)
+        text = clean_text(item)
         if text and text.lower() not in seen:
             seen.add(text.lower())
             out.append(text[:500])
     return out[:25]
 
 
-def _clean_attributes(value: Any) -> dict[str, str]:
+def clean_attributes(value: Any) -> dict[str, str]:
     if isinstance(value, list):  # [{"name": ..., "value": ...}]
         value = {
-            item.get("name") or item.get("key"): item.get("value")
+            item.get("name") or item.get("label") or item.get("key"): item.get("value")
             for item in value
-            if isinstance(item, dict) and (item.get("name") or item.get("key"))
+            if isinstance(item, dict) and (item.get("name") or item.get("label") or item.get("key"))
         }
     if not isinstance(value, dict):
         return {}
     out: dict[str, str] = {}
     for key, raw in value.items():
-        text = _clean_optional_str(raw)
+        text = clean_text(raw)
         if key and text:
             out[str(key).strip()[:100]] = text[:500]
-        if len(out) >= 50:
+        if len(out) >= 40:
             break
     return out
 
 
-Number = Annotated[float | None, BeforeValidator(parse_number)]
-Currency = Annotated[str | None, BeforeValidator(normalize_currency)]
-OptStr = Annotated[str | None, BeforeValidator(_clean_optional_str)]
+MAX_KEYWORDS = 10
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[a-z]{2,}", re.IGNORECASE)
+_ID_NUMBER_RE = re.compile(r"\d[\d\s().+/-]{5,}\d")
+
+
+def _clean_keywords(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = re.split(r"[,;\n]", value)
+    out: list[str] = []
+    for raw in value:
+        text = re.sub(r"\s+", " ", str(raw)).strip().strip("\"'")
+        if not text or text.lower() in (k.lower() for k in out):
+            continue
+        if len(text) > 60:
+            raise ValueError(f"keyword {text[:30]!r}… is too long (max 60 characters)")
+        # Governance: keywords must not be used to look up individuals by their identifiers.
+        if _EMAIL_RE.search(text) or any(sum(c.isdigit() for c in m.group()) >= 9 for m in _ID_NUMBER_RE.finditer(text)):
+            raise ValueError(f"keyword {text!r} looks like a personal identifier (email address, phone or ID "
+                             "number); searching for individuals' identifiers is not allowed")
+        out.append(text)
+    if len(out) > MAX_KEYWORDS:
+        raise ValueError(f"at most {MAX_KEYWORDS} keywords are allowed")
+    return out
+
+
+OptStr = Annotated[str | None, BeforeValidator(clean_text)]
 StrList = Annotated[list[str], BeforeValidator(_clean_str_list)]
+Keywords = Annotated[list[str], BeforeValidator(_clean_keywords)]
 Confidence = Annotated[float, BeforeValidator(_coerce_confidence), Field(ge=0.0, le=1.0)]
+Attributes = Annotated[dict[str, str], BeforeValidator(clean_attributes)]
 
 
-def _fmt_amount(amount: float, currency: str | None) -> str:
-    text = f"{amount:,.2f}".removesuffix(".00")
-    return f"{currency} {text}" if currency else text
+def normalize_type(value: Any) -> str:
+    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", str(value or ""))  # "CreditCard" -> "Credit Card"
+    text = re.sub(r"[_\s-]+", " ", text).strip().lower()
+    return text[:40] or "other"
 
 
-class Rate(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    label: str = "Rate"
-    value: Number = None
-    min: Number = None
-    max: Number = None
-    period: OptStr = None
-
-    @field_validator("label", mode="before")
-    @classmethod
-    def _label(cls, value: Any) -> str:
-        return _clean_optional_str(value) or "Rate"
-
-    @field_validator("value", "min", "max")
-    @classmethod
-    def _range(cls, value: float | None) -> float | None:
-        if value is not None and not 0 <= value <= 1000:
-            raise ValueError("rate must be between 0 and 1000 percent")
-        return value
-
-    @model_validator(mode="after")
-    def _has_value(self) -> Rate:
-        if self.value is None and self.min is None and self.max is None:
-            raise ValueError("rate has no numeric value")
-        if self.min is not None and self.max is not None and self.min > self.max:
-            self.min, self.max = self.max, self.min
-        return self
-
-    def display(self) -> str:
-        if self.value is not None:
-            figure = f"{self.value:g}%"
-        elif self.min is not None and self.max is not None:
-            figure = f"{self.min:g}% – {self.max:g}%"
-        elif self.min is not None:
-            figure = f"from {self.min:g}%"
-        else:
-            figure = f"up to {self.max:g}%"
-        suffix = f" ({self.period})" if self.period else ""
-        return f"{self.label}: {figure}{suffix}"
-
-
-class Fee(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    label: str = "Fee"
-    amount: Number = None
-    currency: Currency = None
-    percentage: Number = None
-    frequency: OptStr = None
-    description: OptStr = None
-
-    @field_validator("label", mode="before")
-    @classmethod
-    def _label(cls, value: Any) -> str:
-        return _clean_optional_str(value) or "Fee"
-
-    @field_validator("amount")
-    @classmethod
-    def _amount(cls, value: float | None) -> float | None:
-        if value is not None and value < 0:
-            raise ValueError("fee amount cannot be negative")
-        return value
-
-    @field_validator("percentage")
-    @classmethod
-    def _percentage(cls, value: float | None) -> float | None:
-        if value is not None and not 0 <= value <= 100:
-            raise ValueError("fee percentage must be between 0 and 100")
-        return value
-
-    @model_validator(mode="after")
-    def _has_content(self) -> Fee:
-        if self.amount is None and self.percentage is None and self.description is None:
-            raise ValueError("fee has no amount, percentage or description")
-        return self
-
-    def display(self) -> str:
-        parts = []
-        if self.amount is not None:
-            parts.append(_fmt_amount(self.amount, self.currency))
-        if self.percentage is not None:
-            parts.append(f"{self.percentage:g}%")
-        if not parts and self.description:
-            parts.append(self.description)
-        text = f"{self.label}: {' + '.join(parts)}"
-        return f"{text} ({self.frequency})" if self.frequency else text
-
-
-def _keep_valid(model: type[BaseModel]):
-    """Validate list items individually and drop invalid ones instead of rejecting the product."""
-
-    def validator(value: Any) -> list[Any]:
-        if value is None:
-            return []
-        if not isinstance(value, list):
-            value = [value]
-        items = []
-        for item in value:
-            if isinstance(item, (int, float, str)):
-                item = {"value": item} if model is Rate else {"description": item}
-            try:
-                items.append(model.model_validate(item))
-            except ValidationError:
-                continue
-        return items[:20]
-
-    return validator
-
-
-def describe_rates(rates: list[Any] | None) -> list[str]:
-    return [r.display() for r in _keep_valid(Rate)(rates or [])]
-
-
-def describe_fees(fees: list[Any] | None) -> list[str]:
-    return [f.display() for f in _keep_valid(Fee)(fees or [])]
-
-
-FIELD_GROUPS: dict[DataType, dict[str, Any]] = {
-    DataType.RATES: {"rates": []},
-    DataType.FEES: {"fees": []},
-    DataType.AMOUNTS: {"min_amount": None, "max_amount": None, "currency": None, "tenure": None},
-    DataType.ELIGIBILITY: {"eligibility": []},
-    DataType.FEATURES: {"features": [], "attributes": {}},
-    DataType.CONDITIONS: {"conditions": []},
-}
-
-
-class ExtractedProduct(BaseModel):
+class ExtractedItem(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     name: str = Field(min_length=2, max_length=300)
-    provider: OptStr = None
-    category: ProductCategory = ProductCategory.OTHER
-    category_confidence: Confidence = 0.0
-    classification_method: OptStr = None
+    type: str = "other"
     description: OptStr = None
-    rates: Annotated[list[Rate], BeforeValidator(_keep_valid(Rate))] = Field(default_factory=list)
-    fees: Annotated[list[Fee], BeforeValidator(_keep_valid(Fee))] = Field(default_factory=list)
-    min_amount: Number = None
-    max_amount: Number = None
-    currency: Currency = None
-    tenure: OptStr = None
-    eligibility: StrList = Field(default_factory=list)
-    features: StrList = Field(default_factory=list)
-    conditions: StrList = Field(default_factory=list)
-    attributes: Annotated[dict[str, str], BeforeValidator(_clean_attributes)] = Field(default_factory=dict)
+    attributes: Attributes = Field(default_factory=dict)
     confidence: Confidence = 0.5
     source_url: HttpUrl | FileUrl
     source_snippet: OptStr = None
     extraction_method: str = "unknown"
+    matched_keywords: StrList = Field(default_factory=list)
     unverified: StrList = Field(default_factory=list)  # facts removed by grounding
 
     @field_validator("name", mode="before")
     @classmethod
     def _name(cls, value: Any) -> str:
-        text = _clean_optional_str(value)
+        text = clean_text(value)
         if text is None:
-            raise ValueError("product name is required")
-        return text
+            raise ValueError("item name is required")
+        return text[:300]
 
-    @field_validator("category", mode="before")
+    @field_validator("type", mode="before")
     @classmethod
-    def _category(cls, value: Any) -> ProductCategory:
-        return coerce_category(value) or ProductCategory.OTHER
+    def _type(cls, value: Any) -> str:
+        return normalize_type(value)
 
     @field_validator("description")
     @classmethod
@@ -387,26 +211,8 @@ class ExtractedProduct(BaseModel):
     def _snippet(cls, value: str | None) -> str | None:
         return value[:500] if value else value
 
-    @field_validator("min_amount", "max_amount")
-    @classmethod
-    def _non_negative(cls, value: float | None) -> float | None:
-        return None if value is not None and value < 0 else value
 
-    @model_validator(mode="after")
-    def _amount_order(self) -> ExtractedProduct:
-        if self.min_amount is not None and self.max_amount is not None and self.min_amount > self.max_amount:
-            self.min_amount, self.max_amount = self.max_amount, self.min_amount
-        return self
-
-    def restrict_to(self, data_types: set[DataType]) -> ExtractedProduct:
-        update: dict[str, Any] = {}
-        for data_type, defaults in FIELD_GROUPS.items():
-            if data_type not in data_types:
-                update.update(defaults)
-        return self.model_copy(update=update) if update else self
-
-
-class RejectedProduct(BaseModel):
+class RejectedItem(BaseModel):
     name: str | None = None
     reason: str
     errors: list[str] = Field(default_factory=list)
@@ -416,52 +222,44 @@ def _name_key(name: str) -> str:
     return re.sub(r"\W+", " ", name.lower()).strip()
 
 
-def validate_products(
-    raw_products: list[Any],
-    *,
-    source_url: str,
-    min_confidence: float,
-    data_types: set[DataType],
-) -> tuple[list[ExtractedProduct], list[RejectedProduct]]:
-    valid: dict[str, ExtractedProduct] = {}
-    rejected: list[RejectedProduct] = []
+def validate_items(
+    raw_items: list[Any], *, source_url: str, min_confidence: float,
+) -> tuple[list[ExtractedItem], list[RejectedItem]]:
+    valid: dict[str, ExtractedItem] = {}
+    rejected: list[RejectedItem] = []
 
-    for item in raw_products:
-        if not isinstance(item, dict):
-            rejected.append(RejectedProduct(reason="extraction output is not an object"))
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            rejected.append(RejectedItem(reason="extraction output is not an object"))
             continue
-        name = _clean_optional_str(item.get("name"))
+        name = clean_text(raw.get("name"))
         try:
-            product = ExtractedProduct.model_validate({**item, "source_url": source_url})
+            item = ExtractedItem.model_validate({**raw, "source_url": source_url})
         except ValidationError as exc:
-            errors = [f"{'.'.join(str(p) for p in e['loc']) or 'product'}: {e['msg']}" for e in exc.errors()]
-            rejected.append(RejectedProduct(name=name and name[:300], reason="schema validation failed", errors=errors[:10]))
+            errors = [f"{'.'.join(str(p) for p in e['loc']) or 'item'}: {e['msg']}" for e in exc.errors()]
+            rejected.append(RejectedItem(name=name and name[:300], reason="schema validation failed", errors=errors[:10]))
             continue
 
-        if product.confidence < min_confidence:
-            rejected.append(
-                RejectedProduct(
-                    name=product.name,
-                    reason=f"confidence {product.confidence:.2f} below threshold {min_confidence:.2f}",
-                )
-            )
+        if item.confidence < min_confidence:
+            rejected.append(RejectedItem(
+                name=item.name, reason=f"confidence {item.confidence:.2f} below threshold {min_confidence:.2f}"))
             continue
 
-        product = product.restrict_to(data_types)
-        key = _name_key(product.name)
+        key = _name_key(item.name)
         existing = valid.get(key)
         if existing is None:
-            valid[key] = product
-        elif product.confidence > existing.confidence:
-            rejected.append(RejectedProduct(name=existing.name, reason="duplicate of a higher-confidence product"))
-            valid[key] = product
+            valid[key] = item
+        elif item.confidence > existing.confidence:
+            rejected.append(RejectedItem(name=existing.name, reason="duplicate of a higher-confidence item"))
+            valid[key] = item
         else:
-            rejected.append(RejectedProduct(name=product.name, reason="duplicate of a higher-confidence product"))
+            rejected.append(RejectedItem(name=item.name, reason="duplicate of a higher-confidence item"))
 
     return list(valid.values()), rejected
 
 
-PAGE_TYPES = {"product_detail", "product_listing", "comparison", "rates_table", "article", "legal", "other"}
+PAGE_TYPES = {"article", "news", "blog_post", "product_page", "listing", "directory", "documentation", "homepage",
+              "event", "profile", "forum", "report", "legal", "other"}
 
 
 class Entity(BaseModel):
@@ -476,7 +274,7 @@ def _coerce_entities(value: Any) -> list[dict[str, str]]:
     for item in value if isinstance(value, list) else [value]:
         if isinstance(item, str):
             item = {"name": item}
-        if isinstance(item, dict) and (name := _clean_optional_str(item.get("name"))):
+        if isinstance(item, dict) and (name := clean_text(item.get("name"))):
             out.append({"name": name[:200], "type": str(item.get("type") or "other")[:40]})
     return out[:50]
 
@@ -485,7 +283,7 @@ class PageUnderstanding(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     page_type: str = "other"
-    institution: OptStr = None
+    publisher: OptStr = None
     topic: OptStr = None
     entities: Annotated[list[Entity], BeforeValidator(_coerce_entities)] = Field(default_factory=list)
     important_sections: StrList = Field(default_factory=list)
@@ -497,22 +295,6 @@ class PageUnderstanding(BaseModel):
     def _page_type(cls, value: Any) -> str:
         key = re.sub(r"[\s-]+", "_", str(value or "")).strip().lower()
         return key if key in PAGE_TYPES else "other"
-
-
-class ProductSummary(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    summary: str = ""
-    key_features: StrList = Field(default_factory=list)
-    fees_and_rates: StrList = Field(default_factory=list)
-    eligibility: StrList = Field(default_factory=list)
-    important_conditions: StrList = Field(default_factory=list)
-    method: str = "template"
-
-    @field_validator("summary", mode="before")
-    @classmethod
-    def _summary(cls, value: Any) -> str:
-        return (_clean_optional_str(value) or "")[:3000]
 
 
 class ReportSection(BaseModel):
@@ -533,7 +315,7 @@ def _coerce_items(model: type[BaseModel], text_fields: tuple[str, ...], limit: i
         for item in items:
             if not isinstance(item, dict):
                 continue
-            cleaned = {k: _clean_optional_str(item.get(k)) for k in model.model_fields}
+            cleaned = {k: clean_text(item.get(k)) for k in model.model_fields}
             if all(cleaned.get(k) for k in text_fields):
                 out.append({k: (v[:1500] if isinstance(v, str) else v) for k, v in cleaned.items()})
         return out[:limit]
@@ -541,9 +323,27 @@ def _coerce_items(model: type[BaseModel], text_fields: tuple[str, ...], limit: i
     return validator
 
 
+class KeywordPassage(BaseModel):
+    text: str
+    heading: str | None = None
+    match: Literal["exact", "related"]
+    score: float | None = None
+
+
+class KeywordFinding(BaseModel):
+    keyword: str
+    found: bool = False
+    summary: str = ""
+    points: StrList = Field(default_factory=list)
+    passages: list[KeywordPassage] = Field(default_factory=list)
+    items: list[str] = Field(default_factory=list)  # names of extracted items that mention the keyword
+    method: str = "extract"  # llm | extract
+
+
 class PageReport(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    keyword_findings: list[KeywordFinding] = Field(default_factory=list)
     detailed_summary: str = ""
     sections: Annotated[list[ReportSection], BeforeValidator(_coerce_items(ReportSection, ("title", "summary"), 25))] = (
         Field(default_factory=list))
@@ -563,9 +363,7 @@ class PageReport(BaseModel):
     overview: str = ""
     audience: OptStr = None
     key_points: StrList = Field(default_factory=list)
-    products_overview: StrList = Field(default_factory=list)
-    rates_and_fees: StrList = Field(default_factory=list)
-    eligibility_and_conditions: StrList = Field(default_factory=list)
+    items_overview: StrList = Field(default_factory=list)
     things_to_watch: StrList = Field(default_factory=list)
     data_gaps: StrList = Field(default_factory=list)
     method: str = "basic"  # llm | basic
@@ -574,12 +372,12 @@ class PageReport(BaseModel):
     @field_validator("headline", mode="before")
     @classmethod
     def _headline(cls, value: Any) -> str:
-        return (_clean_optional_str(value) or "")[:200]
+        return (clean_text(value) or "")[:200]
 
     @field_validator("overview", mode="before")
     @classmethod
     def _overview(cls, value: Any) -> str:
-        return (_clean_optional_str(value) or "")[:4000]
+        return (clean_text(value) or "")[:4000]
 
 
 class ComplianceCheck(BaseModel):
@@ -628,9 +426,18 @@ def _ensure_public_host(url: HttpUrl | None) -> HttpUrl | None:
     return url
 
 
+def _unique_data_types(value: list[DataType]) -> list[DataType]:
+    return list(dict.fromkeys(value)) or list(DataType)
+
+
+DataTypes = Annotated[list[DataType], Field(default_factory=lambda: list(DataType))]
+KEYWORDS_DESCRIPTION = "Optional keywords to look for; their results are reported first"
+
+
 class ScrapeRequest(BaseModel):
     url: HttpUrl
-    data_types: list[DataType] = Field(default_factory=lambda: list(DataType))
+    keywords: Keywords = Field(default_factory=list, description=KEYWORDS_DESCRIPTION)
+    data_types: DataTypes
     render_mode: Literal["auto", "http", "browser"] = "auto"
     api_endpoint: HttpUrl | None = Field(
         default=None, description="Official JSON API endpoint to use instead of scraping, if you have one."
@@ -645,7 +452,7 @@ class ScrapeRequest(BaseModel):
     @field_validator("data_types")
     @classmethod
     def _data_types(cls, value: list[DataType]) -> list[DataType]:
-        return list(dict.fromkeys(value)) or list(DataType)
+        return _unique_data_types(value)
 
 
 class DocumentFolderRequest(BaseModel):
@@ -653,13 +460,14 @@ class DocumentFolderRequest(BaseModel):
 
     folder: str = Field(min_length=1, description="Folder path on the machine running the API")
     recursive: bool = False
-    data_types: list[DataType] = Field(default_factory=lambda: list(DataType))
+    keywords: Keywords = Field(default_factory=list, description=KEYWORDS_DESCRIPTION)
+    data_types: DataTypes
     llm_profile: str | None = None
 
     @field_validator("data_types")
     @classmethod
     def _data_types(cls, value: list[DataType]) -> list[DataType]:
-        return list(dict.fromkeys(value)) or list(DataType)
+        return _unique_data_types(value)
 
 
 class PreviousDocument(BaseModel):
@@ -668,12 +476,12 @@ class PreviousDocument(BaseModel):
     job_id: str
     match: Literal["identical", "same_name"]  # same content, or same file name with new content
     status: JobStatus
-    product_count: int
+    item_count: int
     processed_at: datetime
 
 
 class UploadedFile(BaseModel):
-    name: str  # path as chosen in the browser, e.g. "brochures/cards.pdf"
+    name: str  # path as chosen in the browser, e.g. "brochures/guide.pdf"
     bytes: int
     sha256: str | None = None
     stored_as: str | None = None
@@ -694,20 +502,22 @@ class UploadBatch(BaseModel):
 
 
 class ProcessUploadRequest(BaseModel):
-    data_types: list[DataType] = Field(default_factory=lambda: list(DataType))
+    keywords: Keywords = Field(default_factory=list, description=KEYWORDS_DESCRIPTION)
+    data_types: DataTypes
     llm_profile: str | None = None
     update_existing: bool = True
 
     @field_validator("data_types")
     @classmethod
     def _data_types(cls, value: list[DataType]) -> list[DataType]:
-        return list(dict.fromkeys(value)) or list(DataType)
+        return _unique_data_types(value)
 
 
 class DocumentJobRequest(BaseModel):
     source: Literal["document"] = "document"
     document_path: str
-    data_types: list[DataType] = Field(default_factory=lambda: list(DataType))
+    keywords: Keywords = Field(default_factory=list)
+    data_types: DataTypes
     llm_profile: str | None = None
     original_name: str | None = None
     file_sha256: str | None = None
@@ -727,7 +537,7 @@ class JobOut(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     updated_at: datetime | None = None
-    product_count: int = 0
+    item_count: int = 0
 
 
 class ReferenceOut(BaseModel):
@@ -739,21 +549,17 @@ class ReferenceOut(BaseModel):
     retrieved_at: datetime
 
 
-class ProductOut(BaseModel):
+class ItemOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     job_id: str
     name: str
-    provider: str | None = None
-    category: str
-    category_confidence: float
-    classification_method: str | None = None
+    type: str
     description: str | None = None
     confidence: float
     extraction_method: str | None = None
     data: dict[str, Any]
-    summary: dict[str, Any] | None = None
     references: list[ReferenceOut] = Field(default_factory=list)
     created_at: datetime
 
@@ -762,7 +568,7 @@ class JobDetail(JobOut):
     request: dict[str, Any]
     compliance: dict[str, Any] | None = None
     events: list[dict[str, Any]] = Field(default_factory=list)
-    products: list[ProductOut] = Field(default_factory=list)
+    items: list[ItemOut] = Field(default_factory=list)
     understanding: dict[str, Any] | None = None
     page_report: dict[str, Any] | None = None
     rejected: list[dict[str, Any]] = Field(default_factory=list)

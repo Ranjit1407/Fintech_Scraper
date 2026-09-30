@@ -55,8 +55,8 @@ export default function App() {
         <button className="brand" onClick={() => setTab("new")}>
           <span className="brand-mark" aria-hidden="true">◆</span>
           <span>
-            <span className="brand-name">Fintech Scraper</span>
-            <span className="brand-sub muted small">Compliance-first financial product extraction</span>
+            <span className="brand-name">Web Scraper</span>
+            <span className="brand-sub muted small">Governance-first scraping of any website, with keyword search</span>
           </span>
         </button>
         <nav className="tabs" aria-label="Views">

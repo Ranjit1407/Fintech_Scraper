@@ -90,7 +90,7 @@ class ExtractedTable:
 
 
 @dataclass
-class FinancialFigure:
+class Figure:
     kind: str  # percentage | amount
     value: float
     raw: str
@@ -113,7 +113,7 @@ class ParsedPage:
     json_ld: list[dict[str, Any]]
     blocks: list[TextBlock]
     tables: list[ExtractedTable]
-    figures: list[FinancialFigure]
+    figures: list[Figure]
     content_hash: str
     stats: dict[str, int] = field(default_factory=dict)
 
@@ -263,8 +263,8 @@ def extract_links(soup: BeautifulSoup, base_url: str) -> list[Link]:
 
 
 def _is_noise(tag: Tag) -> bool:
-    # Hidden elements are deliberately kept: collapsed accordions and tabs on financial product
-    # pages often hold the fees and conditions we need.
+    # Hidden elements are deliberately kept: collapsed accordions and tabs often hold details such as
+    # prices, dates and conditions.
     if tag.get("role") in NOISE_ROLES:
         return True
     tokens = list(tag.get("class") or [])
@@ -382,8 +382,8 @@ def extract_blocks(soup: BeautifulSoup) -> list[TextBlock]:
 
 
 def deduplicate(blocks: list[TextBlock]) -> list[TextBlock]:
-    # Headings define sections, so they are always kept. Short facts like "No annual fee" legitimately
-    # repeat under different products, so they are dropped only when repeated back-to-back.
+    # Headings define sections, so they are always kept. Short facts like "Free delivery" legitimately
+    # repeat under different items, so they are dropped only when repeated back-to-back.
     seen: set[str] = set()
     previous = ""
     out: list[TextBlock] = []
@@ -404,11 +404,11 @@ def _figure_context(text: str, start: int, end: int) -> str:
     return _collapse(text[max(0, start - 60) : end + 30])
 
 
-def find_financial_figures(text: str, limit: int = 200) -> list[FinancialFigure]:
-    figures: list[FinancialFigure] = []
+def find_figures(text: str, limit: int = 200) -> list[Figure]:
+    figures: list[Figure] = []
     for match in PERCENT_RE.finditer(text):
         figures.append(
-            FinancialFigure("percentage", float(match.group("num")), match.group(0),
+            Figure("percentage", float(match.group("num")), match.group(0),
                             _figure_context(text, match.start(), match.end()))
         )
     for regex in (AMOUNT_RE, AMOUNT_SUFFIX_RE):
@@ -419,7 +419,7 @@ def find_financial_figures(text: str, limit: int = 200) -> list[FinancialFigure]
                 value *= _AMOUNT_MULTIPLIERS[multiplier.lower()]
             code = match.group("cur").upper()
             figures.append(
-                FinancialFigure("amount", value, match.group(0), _figure_context(text, match.start(), match.end()),
+                Figure("amount", value, match.group(0), _figure_context(text, match.start(), match.end()),
                                 currency=_CURRENCY_CODES.get(code, code))
             )
     return figures[:limit]
@@ -444,7 +444,7 @@ def parse_html(html: str, url: str) -> ParsedPage:
     blocks = deduplicate(raw_blocks)
 
     body_text = "\n".join(b.text for b in blocks)
-    figures = find_financial_figures(body_text + "\n" + _table_lines(tables))
+    figures = find_figures(body_text + "\n" + _table_lines(tables))
     title = metadata.get("og:title") or metadata.get("title") or h1_text or url
     return ParsedPage(
         url=url,
@@ -518,7 +518,7 @@ def parse_json_payload(data: Any, url: str) -> ParsedPage:
         json_ld=[],
         blocks=blocks,
         tables=tables,
-        figures=find_financial_figures(text + "\n" + _table_lines(tables)),
+        figures=find_figures(text + "\n" + _table_lines(tables)),
         content_hash=hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode("utf-8")).hexdigest(),
         stats={"tables": len(tables)},
     )

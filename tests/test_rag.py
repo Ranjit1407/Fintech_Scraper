@@ -1,7 +1,7 @@
 import asyncio
 import re
 
-from app.ai.extraction import merge_part_products
+from app.ai.extraction import merge_part_items
 from app.ai.rag import RagConfig, build_index, chunk_page, source_length, split_parts
 from app.database.database import SessionLocal, init_db
 from app.database.models import ScrapeJob
@@ -48,18 +48,18 @@ def test_tfidf_retrieval_finds_the_relevant_chunk(tmp_path):
     assert best and best[0].heading == "Saver 37 Account"
 
 
-def test_products_split_across_parts_are_merged():
-    merged = merge_part_products([
-        [{"name": "Saver Account", "rates": [{"label": "APY", "value": 3.1}], "features": ["Online banking"],
+def test_items_split_across_parts_are_merged():
+    merged = merge_part_items([
+        [{"name": "Saver Account", "type": "other", "attributes": {"APY": "3.1%", "Access": "Online"},
           "confidence": 0.6, "extraction_method": "llm"}],
-        [{"name": "Saver Account", "rates": [{"label": "APY", "value": 3.1}], "fees": [{"label": "Monthly", "amount": 5}],
-          "tenure": "12 months", "confidence": 0.8, "extraction_method": "rules"}],
+        [{"name": "Saver Account", "type": "savings account", "attributes": {"APY": "3.1%", "Monthly fee": "$5"},
+          "description": "Easy access savings.", "confidence": 0.8, "extraction_method": "table"}],
     ])
     assert len(merged) == 1
-    product = merged[0]
-    assert product["rates"] == [{"label": "APY", "value": 3.1}]
-    assert product["fees"] == [{"label": "Monthly", "amount": 5}] and product["tenure"] == "12 months"
-    assert product["confidence"] == 0.8 and product["extraction_method"] == "llm"
+    item = merged[0]
+    assert item["attributes"] == {"APY": "3.1%", "Monthly fee": "$5", "Access": "Online"}
+    assert item["type"] == "savings account" and item["description"] == "Easy access savings."
+    assert item["confidence"] == 0.8 and item["extraction_method"] == "llm"
 
 
 class LongDocLLM:
@@ -73,13 +73,13 @@ class LongDocLLM:
     async def complete_json(self, system, user):
         self.prompts.append(user)
         if user.startswith("Analyse this web page"):
-            return {"page_type": "product_listing", "institution": "Northwind", "topic": "Savings accounts"}
-        if user.startswith("Extract every distinct"):
-            products = []
+            return {"page_type": "listing", "publisher": "Northwind", "topic": "Savings accounts"}
+        if user.startswith("Extract the distinct items"):
+            items = []
             for n, rate in re.findall(r"# Saver (\d+) Account\n- (\d\.\d\d)% APY", user):
-                products.append({"name": f"Saver {n} Account", "category": "Banking", "confidence": 0.9,
-                                 "rates": [{"label": "APY", "value": float(rate)}]})
-            return {"products": products}
+                items.append({"name": f"Saver {n} Account", "type": "savings account", "confidence": 0.9,
+                              "attributes": {"APY": f"{rate}%"}})
+            return {"items": items}
         if user.startswith("This is part"):
             part = re.search(r"part (\d+) of (\d+)", user).group(1)
             numbers = re.findall(r"# Saver (\d+) Account", user)
@@ -113,10 +113,10 @@ def test_long_document_is_read_in_full_with_retrieval(tmp_path, monkeypatch):
     rag = job.extraction.rag
     assert rag["parts"] > 1 and rag["chunks"] >= rag["parts"] and rag["embedding"] == "tfidf"
 
-    # every part was sent for extraction and for notes, so products from the end of the document are found
-    extraction_prompts = [p for p in llm.prompts if p.startswith("Extract every distinct")]
+    # every part was sent for extraction and for notes, so items from the end of the document are found
+    extraction_prompts = [p for p in llm.prompts if p.startswith("Extract the distinct items")]
     assert len(extraction_prompts) == rag["parts"]
-    names = {p.name for p in job.products}
+    names = {i.name for i in job.items}
     assert {"Saver 1 Account", f"Saver {SECTIONS} Account"} <= names
     assert len([p for p in llm.prompts if p.startswith("This is part")]) == rag["parts"]
 

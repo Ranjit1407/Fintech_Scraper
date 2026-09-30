@@ -179,7 +179,11 @@ async def _ollama_embed(texts: list[str], config: RagConfig) -> np.ndarray:
 def _tfidf(texts: list[str]) -> np.ndarray:
     from sklearn.feature_extraction.text import TfidfVectorizer
 
-    return TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True).fit_transform(texts).toarray().astype(np.float32)
+    try:
+        vectorizer = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, stop_words="english")
+        return vectorizer.fit_transform(texts).toarray().astype(np.float32)
+    except ValueError:  # every word was a stop word
+        return TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True).fit_transform(texts).toarray().astype(np.float32)
 
 
 @dataclass

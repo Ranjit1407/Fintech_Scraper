@@ -125,7 +125,7 @@ def describe_previous(match: tuple[ScrapeJob, str] | None) -> PreviousDocument |
     if match is None:
         return None
     job, kind = match
-    return PreviousDocument(job_id=job.id, match=kind, status=job.status, product_count=len(job.products),
+    return PreviousDocument(job_id=job.id, match=kind, status=job.status, item_count=len(job.items),
                             processed_at=job.finished_at or job.created_at)
 
 

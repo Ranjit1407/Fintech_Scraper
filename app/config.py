@@ -15,9 +15,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=PROJECT_ROOT / ".env", env_file_encoding="utf-8", extra="ignore")
 
-    database_url: str = "sqlite:///./fintech_scraper.db"
+    database_url: str = "sqlite:///./scraper.db"
 
-    user_agent: str = "FintechScraperBot/1.0 (+https://example.com/bot-info)"
+    user_agent: str = "WebScraperBot/1.0 (+https://example.com/bot-info)"
     request_timeout: float = 20.0
     min_request_interval: float = 2.0  # per host
     max_retries: int = 3
@@ -51,8 +51,7 @@ class Settings(BaseSettings):
     # Keep false when deployed: otherwise the API can be used to probe internal networks.
     allow_private_hosts: bool = False
 
-    classifier_model_path: str | None = None
-    min_product_confidence: float = 0.3
+    min_item_confidence: float = 0.3
 
     use_celery: bool = False
     redis_url: str = "redis://localhost:6379/0"

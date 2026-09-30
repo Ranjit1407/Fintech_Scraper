@@ -36,8 +36,6 @@ export const api = {
   reportUrl: (id, format) => `${BASE}/api/jobs/${id}/report/${format}`,
 };
 
-export const CATEGORIES = ["Loan", "Credit Card", "Insurance", "Investment", "Banking", "Payment", "Other"];
-
 export const isActive = (status) => status === "queued" || status === "running";
 
 export function formatTime(value) {
@@ -50,7 +48,7 @@ export const percent = (value) => `${Math.round((value ?? 0) * 100)}%`;
 
 export const isDocument = (url) => url.startsWith("file:");
 
-/** "bank.com/cards" for web pages, "Document · rates.pdf" for local files. */
+/** "example.com/pricing" for web pages, "Document · guide.pdf" for local files. */
 export function sourceLabel(url) {
   if (!isDocument(url)) return url.replace(/^https?:\/\//, "");
   return `Document · ${decodeURIComponent(url.split("/").pop())}`;

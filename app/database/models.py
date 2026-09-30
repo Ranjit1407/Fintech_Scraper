@@ -27,13 +27,13 @@ class Source(Base):
     url: Mapped[str] = mapped_column(String(2048), unique=True, index=True)
     domain: Mapped[str] = mapped_column(String(255), index=True)
     title: Mapped[str | None] = mapped_column(String(500))
-    institution: Mapped[str | None] = mapped_column(String(255))
+    publisher: Mapped[str | None] = mapped_column("institution", String(255))  # column name kept for existing databases
     api_available: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_scraped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     jobs: Mapped[list[ScrapeJob]] = relationship(back_populates="source")
-    products: Mapped[list[Product]] = relationship(back_populates="source")
+    items: Mapped[list[Item]] = relationship(back_populates="source")
 
 
 class ScrapeJob(Base):
@@ -54,9 +54,7 @@ class ScrapeJob(Base):
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # last re-upload
 
     source: Mapped[Source | None] = relationship(back_populates="jobs")
-    products: Mapped[list[Product]] = relationship(
-        back_populates="job", cascade="all, delete-orphan", order_by="Product.id"
-    )
+    items: Mapped[list[Item]] = relationship(back_populates="job", cascade="all, delete-orphan", order_by="Item.id")
     extraction: Mapped[ExtractionResult | None] = relationship(
         back_populates="job", cascade="all, delete-orphan", uselist=False
     )
@@ -65,51 +63,27 @@ class ScrapeJob(Base):
     )
 
     @property
-    def product_count(self) -> int:
-        return len(self.products)
+    def item_count(self) -> int:
+        return len(self.items)
 
 
-class Product(Base):
-    __tablename__ = "products"
+class Item(Base):
+    __tablename__ = "items"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[str] = mapped_column(ForeignKey("scrape_jobs.id", ondelete="CASCADE"), index=True)
     source_id: Mapped[int] = mapped_column(ForeignKey("sources.id"), index=True)
     name: Mapped[str] = mapped_column(String(300), index=True)
-    provider: Mapped[str | None] = mapped_column(String(255))
-    category: Mapped[str] = mapped_column(String(40), index=True)
-    category_confidence: Mapped[float] = mapped_column(Float, default=0.0)
-    classification_method: Mapped[str | None] = mapped_column(String(60))
+    type: Mapped[str] = mapped_column(String(40), index=True)
     description: Mapped[str | None] = mapped_column(Text)
     confidence: Mapped[float] = mapped_column(Float)
     extraction_method: Mapped[str | None] = mapped_column(String(40))
-    data: Mapped[dict] = mapped_column(JSONType)  # ExtractedProduct
-    summary: Mapped[dict | None] = mapped_column(JSONType)  # ProductSummary
+    data: Mapped[dict] = mapped_column(JSONType)  # ExtractedItem
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    job: Mapped[ScrapeJob] = relationship(back_populates="products")
-    source: Mapped[Source] = relationship(back_populates="products")
-    attributes: Mapped[list[ProductAttribute]] = relationship(
-        back_populates="product", cascade="all, delete-orphan"
-    )
-    references: Mapped[list[SourceReference]] = relationship(
-        back_populates="product", cascade="all, delete-orphan"
-    )
-
-
-class ProductAttribute(Base):
-    # Rates, fees and other facts as rows, so they can be queried across products.
-    __tablename__ = "product_attributes"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), index=True)
-    kind: Mapped[str] = mapped_column(String(30), index=True)
-    name: Mapped[str] = mapped_column(String(255))
-    value: Mapped[str] = mapped_column(Text)
-    numeric_value: Mapped[float | None] = mapped_column(Float)
-    unit: Mapped[str | None] = mapped_column(String(20))
-
-    product: Mapped[Product] = relationship(back_populates="attributes")
+    job: Mapped[ScrapeJob] = relationship(back_populates="items")
+    source: Mapped[Source] = relationship(back_populates="items")
+    references: Mapped[list[ItemReference]] = relationship(back_populates="item", cascade="all, delete-orphan")
 
 
 class ExtractionResult(Base):
@@ -119,7 +93,7 @@ class ExtractionResult(Base):
     job_id: Mapped[str] = mapped_column(ForeignKey("scrape_jobs.id", ondelete="CASCADE"), unique=True)
     understanding: Mapped[dict | None] = mapped_column(JSONType)
     page_report: Mapped[dict | None] = mapped_column(JSONType)  # PageReport
-    raw_products: Mapped[list | None] = mapped_column(JSONType)
+    raw_items: Mapped[list | None] = mapped_column(JSONType)
     rejected: Mapped[list | None] = mapped_column(JSONType)
     tables: Mapped[list | None] = mapped_column(JSONType)
     text: Mapped[str | None] = mapped_column(Text)
@@ -147,14 +121,14 @@ class DocumentChunk(Base):
     job: Mapped[ScrapeJob] = relationship(back_populates="chunks")
 
 
-class SourceReference(Base):
-    __tablename__ = "source_references"
+class ItemReference(Base):
+    __tablename__ = "item_references"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), index=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), index=True)
     url: Mapped[str] = mapped_column(String(2048))
     snippet: Mapped[str | None] = mapped_column(Text)
     content_hash: Mapped[str | None] = mapped_column(String(64))
     retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    product: Mapped[Product] = relationship(back_populates="references")
+    item: Mapped[Item] = relationship(back_populates="references")

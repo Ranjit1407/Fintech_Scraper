@@ -21,7 +21,7 @@ export default function JobList({ jobs, selectedId, onSelect, title = "Jobs" }) 
                 <span className="job-meta">
                   <StatusBadge status={job.status} />
                   <span className="muted small">
-                    {job.product_count} product{job.product_count === 1 ? "" : "s"} ·{" "}
+                    {job.item_count} item{job.item_count === 1 ? "" : "s"} ·{" "}
                     {job.updated_at ? `updated ${formatTime(job.updated_at)}` : formatTime(job.created_at)}
                   </span>
                 </span>

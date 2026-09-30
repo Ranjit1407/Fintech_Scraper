@@ -1,5 +1,5 @@
 from app.scraper.browser_scraper import needs_browser
-from app.scraper.parser import find_financial_figures, parse_html, parse_json_payload
+from app.scraper.parser import find_figures, parse_html, parse_json_payload
 from tests.fixtures import CARDS_HTML
 
 
@@ -35,7 +35,7 @@ def test_sections_group_blocks_under_headings():
 
 
 def test_financial_figures():
-    figures = find_financial_figures("Borrow $1,500 to $25k at 6.99% APR. Fee: Rs. 499 or 2,500 INR. Hours 5")
+    figures = find_figures("Borrow $1,500 to $25k at 6.99% APR. Fee: Rs. 499 or 2,500 INR. Hours 5")
     amounts = sorted(f.value for f in figures if f.kind == "amount")
     assert amounts == [499, 1500, 2500, 25000]
     assert [f.value for f in figures if f.kind == "percentage"] == [6.99]

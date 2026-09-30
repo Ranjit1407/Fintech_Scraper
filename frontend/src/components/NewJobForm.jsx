@@ -8,16 +8,20 @@ const SOURCES = [
 ];
 
 const DATA_TYPES = [
-  ["rates", "Interest rates"],
-  ["fees", "Fees & charges"],
-  ["amounts", "Amounts & terms"],
-  ["eligibility", "Eligibility"],
-  ["features", "Features"],
-  ["conditions", "Conditions"],
+  ["items", "Items (things the source lists)"],
   ["tables", "Raw tables"],
   ["text", "Page text"],
   ["metadata", "Metadata"],
 ];
+const MAX_KEYWORDS = 10;
+
+function parseKeywords(text) {
+  const seen = new Set();
+  return text
+    .split(/[,;\n]/)
+    .map((k) => k.trim())
+    .filter((k) => k && !seen.has(k.toLowerCase()) && seen.add(k.toLowerCase()));
+}
 
 /** Accepts "example.com/cards" as well as full URLs; returns null when it is not a usable web address. */
 export function normalizeUrl(value) {
@@ -43,7 +47,7 @@ const MAX_LISTED = 8;
 function previousLabel(previous) {
   const when = formatTime(previous.processed_at);
   const what = previous.match === "identical" ? "Uploaded before" : "Newer version of a document uploaded";
-  return `${what} · ${when} · ${previous.product_count} product${previous.product_count === 1 ? "" : "s"}`;
+  return `${what} · ${when} · ${previous.item_count} item${previous.item_count === 1 ? "" : "s"}`;
 }
 
 function uploadQuestion(fresh, again) {
@@ -85,7 +89,7 @@ function UploadReview({ upload, busy, onProcess, onCancel }) {
       )}
       {again > 0 && (
         <div className="alert warn">
-          Re-uploaded documents are not added as new entries. Their existing results are updated: new products and
+          Re-uploaded documents are not added as new entries. Their existing results are updated: new items and
           facts are added, changed values are replaced, and nothing found earlier is removed.
           {busyElsewhere && " One of them is still being processed from an earlier upload; wait for it to finish."}
         </div>
@@ -115,6 +119,8 @@ export default function NewJobForm({ onCreated }) {
   const [renderMode, setRenderMode] = useState("auto");
   const [apiEndpoint, setApiEndpoint] = useState("");
   const [showOptions, setShowOptions] = useState(false);
+  const [wantKeywords, setWantKeywords] = useState(false);
+  const [keywordText, setKeywordText] = useState("");
   const [busy, setBusy] = useState(null);
   const [error, setError] = useState(null);
   const [report, setReport] = useState(null);
@@ -127,6 +133,14 @@ export default function NewJobForm({ onCreated }) {
     });
 
   const dataTypes = () => DATA_TYPES.map(([key]) => key).filter((key) => selected.has(key));
+
+  const keywords = () => {
+    if (!wantKeywords) return [];
+    const list = parseKeywords(keywordText);
+    if (list.length === 0) throw new Error("Enter at least one keyword, or answer No to the keyword question.");
+    if (list.length > MAX_KEYWORDS) throw new Error(`Enter at most ${MAX_KEYWORDS} keywords.`);
+    return list;
+  };
 
   const uploadFolder = (fileList) => {
     const all = Array.from(fileList);
@@ -184,7 +198,7 @@ export default function NewJobForm({ onCreated }) {
     setBusy("process");
     setError(null);
     try {
-      const jobs = await api.processUpload(upload.batch.batch_id, { data_types: dataTypes() });
+      const jobs = await api.processUpload(upload.batch.batch_id, { keywords: keywords(), data_types: dataTypes() });
       setUpload(null);
       onCreated(jobs[0]);
     } catch (err) {
@@ -213,7 +227,7 @@ export default function NewJobForm({ onCreated }) {
     }
     const target = normalizeUrl(url);
     if (!target) {
-      setError("Enter a website address, for example www.example-bank.com/credit-cards");
+      setError("Enter a website address, for example www.example.com/pricing");
       return;
     }
     if (selected.size === 0) {
@@ -221,8 +235,16 @@ export default function NewJobForm({ onCreated }) {
       setShowOptions(true);
       return;
     }
+    let keywordList;
+    try {
+      keywordList = keywords();
+    } catch (err) {
+      setError(err.message);
+      return;
+    }
     const body = {
       url: target,
+      keywords: keywordList,
       data_types: dataTypes(),
       render_mode: renderMode,
       api_endpoint: apiEndpoint.trim() ? normalizeUrl(apiEndpoint) : null,
@@ -250,7 +272,7 @@ export default function NewJobForm({ onCreated }) {
       <h2 className="hero-title">What should we analyse?</h2>
       <p className="hero-lead muted">
         {source === "web"
-          ? "Paste a product page from a bank, lender, insurer, broker or payment provider. Compliance checks run first. If the site doesn't permit scraping, nothing is collected."
+          ? "Paste the address of any web page. Governance checks run first: if the site doesn't permit scraping, nothing is collected."
           : "Upload PDF, Word, text, Markdown or HTML documents, one by one or a whole folder. You review what was uploaded before anything is processed, and each document becomes its own job."}
       </p>
 
@@ -301,7 +323,7 @@ export default function NewJobForm({ onCreated }) {
               autoComplete="url"
               spellCheck="false"
               autoFocus
-              placeholder="www.example-bank.com/credit-cards"
+              placeholder="www.example.com/pricing"
               value={url}
               onChange={(e) => {
                 setUrl(e.target.value);
@@ -374,6 +396,53 @@ export default function NewJobForm({ onCreated }) {
         </p>
       )}
 
+      <div className="keyword-ask">
+        <span className="keyword-question">Do you have keywords to look for?</span>
+        <div className="source-switch compact" role="radiogroup" aria-label="Keywords">
+          {[
+            [false, "No"],
+            [true, "Yes"],
+          ].map(([value, label]) => (
+            <button
+              key={label}
+              type="button"
+              role="radio"
+              aria-checked={wantKeywords === value}
+              className={wantKeywords === value ? "active" : ""}
+              onClick={() => {
+                setWantKeywords(value);
+                setError(null);
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {wantKeywords && (
+        <div className="keyword-entry">
+          <label htmlFor="keyword-input" className="sr-only">
+            Keywords
+          </label>
+          <input
+            id="keyword-input"
+            className="keyword-input"
+            type="text"
+            autoFocus
+            placeholder="e.g. pricing, refund policy, opening hours"
+            value={keywordText}
+            onChange={(e) => {
+              setKeywordText(e.target.value);
+              setError(null);
+            }}
+          />
+          <p className="muted small">
+            Separate keywords with commas (up to {MAX_KEYWORDS}). Results for your keywords are shown first, then
+            everything else. Personal identifiers such as email addresses or phone numbers are not accepted.
+          </p>
+        </div>
+      )}
+
       {error && <div className="alert error">{error}</div>}
 
       {source === "docs" && upload && (
@@ -383,7 +452,7 @@ export default function NewJobForm({ onCreated }) {
       <div className="hero-links">
         {source === "web" ? (
           <button type="button" className="link" disabled={!url.trim() || busy} onClick={() => run("check")}>
-            {busy === "check" ? "Checking compliance…" : "Check compliance only"}
+            {busy === "check" ? "Running governance checks…" : "Run governance checks only"}
           </button>
         ) : (
           <label className="check">
@@ -430,7 +499,7 @@ export default function NewJobForm({ onCreated }) {
                 <input
                   type="text"
                   inputMode="url"
-                  placeholder="api.example-bank.com/v1/products"
+                  placeholder="api.example.com/v1/items"
                   value={apiEndpoint}
                   onChange={(e) => setApiEndpoint(e.target.value)}
                 />

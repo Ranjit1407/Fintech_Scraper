@@ -1,13 +1,16 @@
 import { useEffect, useState } from "react";
 
 const STEPS = [
-  { label: "Reading the source", stages: ["compliance", "document", "router"] },
+  { label: "Governance checks and reading the source", stages: ["compliance", "document", "router"] },
   { label: "Cleaning and understanding", stages: ["cleaning", "understanding"] },
   { label: "Indexing the whole document (RAG)", stages: ["rag"] },
-  { label: "Extracting products from every part", stages: ["extraction", "classification"] },
+  { label: "Extracting items from every part", stages: ["extraction"] },
   { label: "Checking facts against the source", stages: ["validation", "storage"] },
-  { label: "Writing the summary", stages: ["summarization", "report"] },
+  { label: "Searching your keywords", stages: ["keywords"] },
+  { label: "Writing the summary", stages: ["report"] },
 ];
+const RAG_STEP = 2;
+const KEYWORD_STEP = 5;
 
 function stepOf(event, understood) {
   // "extraction" is also used for parsing, before the AI stages start
@@ -22,7 +25,8 @@ function progress(events) {
   for (const event of events) {
     if (event.stage === "understanding") understood = true;
     if (event.stage === "rag") usedRag = true;
-    current = Math.max(current, stepOf(event, understood));
+    // the RAG summary step logs "rag" again while writing the report
+    if (!(event.stage === "rag" && current > RAG_STEP)) current = Math.max(current, stepOf(event, understood));
   }
   return { current, usedRag };
 }
@@ -45,6 +49,7 @@ export default function ProcessingView({ job }) {
 
   const queued = job.status === "queued";
   const { current, usedRag } = progress(job.events);
+  const hasKeywords = (job.request?.keywords || []).length > 0;
   const latest = job.events[job.events.length - 1];
 
   return (
@@ -57,7 +62,7 @@ export default function ProcessingView({ job }) {
       {!queued && (
         <ol className="steps">
           {STEPS.map((step, i) => {
-            const skipped = i === 2 && i < current && !usedRag;
+            const skipped = (i === RAG_STEP && i < current && !usedRag) || (i === KEYWORD_STEP && !hasKeywords);
             const state = skipped ? "skipped" : i < current ? "done" : i === current ? "active" : "pending";
             return (
               <li key={step.label} className={`step step-${state}`}>
@@ -66,7 +71,11 @@ export default function ProcessingView({ job }) {
                 </span>
                 <span>
                   {step.label}
-                  {skipped && <span className="muted small"> · not needed, fits in one pass</span>}
+                  {skipped && (
+                    <span className="muted small">
+                      {i === RAG_STEP ? " · not needed, fits in one pass" : " · no keywords given"}
+                    </span>
+                  )}
                 </span>
               </li>
             );

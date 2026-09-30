@@ -17,7 +17,7 @@ from app.ai.llm_client import LLMClient, list_llm_profiles, llm_status, load_llm
 from app.compliance.checker import run_compliance_checks
 from app.config import get_settings, setup_logging
 from app.database.database import get_db, init_db
-from app.database.models import Product, ScrapeJob, Source
+from app.database.models import Item, ScrapeJob, Source
 from app.documents.loader import SUPPORTED_EXTENSIONS, DocumentError, list_documents, resolve_folder
 from app.documents.uploads import (
     batch_folder,
@@ -38,12 +38,11 @@ from app.validation.schemas import (
     DataType,
     DocumentFolderRequest,
     DocumentJobRequest,
+    ItemOut,
     JobDetail,
     JobOut,
     JobStatus,
     ProcessUploadRequest,
-    ProductCategory,
-    ProductOut,
     ScrapeRequest,
     UploadBatch,
     UploadedFile,
@@ -60,16 +59,16 @@ async def lifespan(_app: FastAPI):
     init_db()
     load_llm_profiles(settings.llm_config_file)  # fail fast on a malformed config or a key in it
     status = llm_status(settings)
-    log.info("Fintech scraper API started (LLM: %s, Celery: %s)",
+    log.info("Web scraper API started (LLM: %s, Celery: %s)",
              f"{status['profile']} → {status['model']}" if status["enabled"] else f"disabled — {status['reason']}",
              settings.use_celery)
     yield
 
 
 app = FastAPI(
-    title="Fintech Scraper API",
-    version="1.0.0",
-    description="Compliance-first collection and AI extraction of financial product data.",
+    title="Web Scraper API",
+    version="2.0.0",
+    description="Governance-first web scraping with grounded AI extraction and keyword search.",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -103,7 +102,7 @@ def _job_detail(job: ScrapeJob) -> JobDetail:
         request=job.request or {},
         compliance=job.compliance,
         events=job.events or [],
-        products=[ProductOut.model_validate(p) for p in job.products],
+        items=[ItemOut.model_validate(i) for i in job.items],
         understanding=extraction.understanding if extraction else None,
         page_report=extraction.page_report if extraction else None,
         rejected=(extraction.rejected or []) if extraction else [],
@@ -139,7 +138,7 @@ def llm_profiles() -> dict:
 
 @app.post("/api/compliance/check", response_model=ComplianceReport)
 async def compliance_check(request: ScrapeRequest) -> ComplianceReport:
-    """Dry run: compliance checks only, nothing is extracted or stored."""
+    """Dry run: governance checks only, nothing is extracted or stored."""
     _check_profile(request.llm_profile)
     llm = LLMClient(settings, profile=request.llm_profile)
     try:
@@ -178,16 +177,17 @@ def create_document_jobs(request: DocumentFolderRequest, background: BackgroundT
     if not files:
         raise HTTPException(status_code=422, detail=f"No supported documents in {folder} "
                                                     f"({', '.join(sorted(SUPPORTED_EXTENSIONS))})")
-    return _queue_documents([(path, None) for path in files], request.data_types, request.llm_profile, db, background)
+    return _queue_documents([(path, None) for path in files], request.keywords, request.data_types,
+                            request.llm_profile, db, background)
 
 
-def _queue_documents(files: list[tuple[Path, UploadedFile | None]], data_types: list[DataType],
+def _queue_documents(files: list[tuple[Path, UploadedFile | None]], keywords: list[str], data_types: list[DataType],
                      llm_profile: str | None, db: Session, background: BackgroundTasks,
                      updates: list[tuple[ScrapeJob, Path, UploadedFile, str]] = ()) -> list[ScrapeJob]:
     jobs = []
     for path, info in files:
-        job_request = DocumentJobRequest(document_path=str(path), data_types=data_types, llm_profile=llm_profile,
-                                         original_name=info.name if info else None,
+        job_request = DocumentJobRequest(document_path=str(path), keywords=keywords, data_types=data_types,
+                                         llm_profile=llm_profile, original_name=info.name if info else None,
                                          file_sha256=info.sha256 if info else None)
         job = ScrapeJob(url=path.as_uri(), request=job_request.model_dump(mode="json"),
                         status=JobStatus.QUEUED.value, events=[])
@@ -198,8 +198,8 @@ def _queue_documents(files: list[tuple[Path, UploadedFile | None]], data_types: 
         previous = job.request or {}
         history = [*previous.get("previous_files", []), previous.get("document_path")]
         job.request = DocumentJobRequest(
-            document_path=str(path), data_types=data_types, llm_profile=llm_profile, original_name=info.name,
-            file_sha256=info.sha256, update=True, previous_files=[h for h in history if h],
+            document_path=str(path), keywords=keywords, data_types=data_types, llm_profile=llm_profile,
+            original_name=info.name, file_sha256=info.sha256, update=True, previous_files=[h for h in history if h],
         ).model_dump(mode="json")
         job.url = path.as_uri()
         job.status, job.error, job.updated_at = JobStatus.QUEUED.value, None, now
@@ -256,7 +256,8 @@ def process_upload(batch_id: str, request: ProcessUploadRequest, background: Bac
         else:
             new_files.append((path, info))
     mark_processed(folder)
-    return _queue_documents(new_files, request.data_types, request.llm_profile, db, background, updates)
+    return _queue_documents(new_files, request.keywords, request.data_types, request.llm_profile, db, background,
+                            updates)
 
 
 @app.delete("/api/uploads/{batch_id}", status_code=204)
@@ -270,7 +271,7 @@ def cancel_upload(batch_id: str) -> Response:
 
 @app.get("/api/jobs", response_model=list[JobOut])
 def list_jobs(limit: int = Query(50, ge=1, le=500), db: Session = Depends(get_db)):
-    stmt = (select(ScrapeJob).options(selectinload(ScrapeJob.products))
+    stmt = (select(ScrapeJob).options(selectinload(ScrapeJob.items))
             .order_by(func.coalesce(ScrapeJob.updated_at, ScrapeJob.created_at).desc()).limit(limit))
     return db.scalars(stmt).all()
 
@@ -283,61 +284,60 @@ def get_job(job_id: str, db: Session = Depends(get_db)) -> JobDetail:
 @app.get("/api/jobs/{job_id}/report/{fmt}")
 def job_report(job_id: str, fmt: Literal["json", "csv", "pdf"], db: Session = Depends(get_db)) -> Response:
     job = _get_job(db, job_id)
-    stem = f"fintech-report-{job.id[:8]}"
+    stem = f"scrape-report-{job.id[:8]}"
     if fmt == "json":
         return JSONResponse(_job_detail(job).model_dump(mode="json"),
                             headers={"Content-Disposition": f'attachment; filename="{stem}.json"'})
     if fmt == "csv":
-        return _download(build_csv(job.products), "text/csv; charset=utf-8", f"{stem}.csv")
-    return _download(build_pdf(job, job.products), "application/pdf", f"{stem}.pdf")
+        return _download(build_csv(job.items), "text/csv; charset=utf-8", f"{stem}.csv")
+    return _download(build_pdf(job, job.items), "application/pdf", f"{stem}.pdf")
 
 
-def _product_query(category: ProductCategory | None, q: str | None):
-    stmt = select(Product).options(selectinload(Product.references)).order_by(Product.created_at.desc())
-    if category:
-        stmt = stmt.where(Product.category == category.value)
+def _item_query(item_type: str | None, q: str | None):
+    stmt = select(Item).options(selectinload(Item.references)).order_by(Item.created_at.desc())
+    if item_type:
+        stmt = stmt.where(Item.type == item_type.strip().lower())
     if q and q.strip():
         pattern = f"%{q.strip()}%"
-        stmt = stmt.where(or_(Product.name.ilike(pattern), Product.provider.ilike(pattern)))
+        stmt = stmt.where(or_(Item.name.ilike(pattern), Item.description.ilike(pattern)))
     return stmt
 
 
-@app.get("/api/products", response_model=list[ProductOut])
-def list_products(
-    category: ProductCategory | None = None,
+@app.get("/api/items", response_model=list[ItemOut])
+def list_items(
+    type: str | None = None,
     q: str | None = None,
     limit: int = Query(200, ge=1, le=2000),
     db: Session = Depends(get_db),
 ):
-    return db.scalars(_product_query(category, q).limit(limit)).all()
+    return db.scalars(_item_query(type, q).limit(limit)).all()
 
 
-@app.get("/api/products/export/csv")
-def export_products(category: ProductCategory | None = None, q: str | None = None, db: Session = Depends(get_db)):
-    products = db.scalars(_product_query(category, q)).all()
-    return _download(build_csv(products), "text/csv; charset=utf-8", "fintech-products.csv")
+@app.get("/api/items/export/csv")
+def export_items(type: str | None = None, q: str | None = None, db: Session = Depends(get_db)):
+    return _download(build_csv(db.scalars(_item_query(type, q)).all()), "text/csv; charset=utf-8", "items.csv")
 
 
-@app.get("/api/products/{product_id}", response_model=ProductOut)
-def get_product(product_id: int, db: Session = Depends(get_db)):
-    product = db.get(Product, product_id)
-    if product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
-    return product
+@app.get("/api/items/{item_id}", response_model=ItemOut)
+def get_item(item_id: int, db: Session = Depends(get_db)):
+    item = db.get(Item, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return item
 
 
 @app.get("/api/stats")
 def stats(db: Session = Depends(get_db)) -> dict:
-    by_category = dict(db.execute(select(Product.category, func.count(Product.id)).group_by(Product.category)).all())
+    by_type = dict(db.execute(select(Item.type, func.count(Item.id)).group_by(Item.type)
+                              .order_by(func.count(Item.id).desc()).limit(8)).all())
     by_status = dict(db.execute(select(ScrapeJob.status, func.count(ScrapeJob.id)).group_by(ScrapeJob.status)).all())
     return {
-        "products": sum(by_category.values()),
+        "items": db.scalar(select(func.count(Item.id))) or 0,
         "sources": db.scalar(select(func.count(Source.id))) or 0,
         "jobs": sum(by_status.values()),
-        "products_by_category": by_category,
+        "items_by_type": by_type,
         "jobs_by_status": by_status,
     }
-
 
 if FRONTEND_DIST.is_dir():
     app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")

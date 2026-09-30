@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 SPEC_PATHS = ("/openapi.json", "/swagger.json")
 PORTAL_PATHS = ("/developers", "/api")
-API_TEXT_RE = re.compile(r"\b(api|apis|developers?|developer portal|open banking)\b", re.IGNORECASE)
+API_TEXT_RE = re.compile(r"\b(api|apis|developers?|developer portal|open data)\b", re.IGNORECASE)
 API_URL_RE = re.compile(r"(//(api|developers?)\.|/developers?\b|/api-docs|/openapi|/swagger)", re.IGNORECASE)
 
 

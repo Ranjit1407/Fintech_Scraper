@@ -1,8 +1,6 @@
 const SECTIONS = [
   ["key_points", "Key points"],
-  ["products_overview", "Products"],
-  ["rates_and_fees", "Rates & fees"],
-  ["eligibility_and_conditions", "Eligibility & conditions"],
+  ["items_overview", "Items"],
   ["things_to_watch", "Things to watch"],
   ["data_gaps", "Not stated in the source"],
 ];

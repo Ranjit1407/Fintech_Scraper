@@ -1,14 +1,12 @@
-import { CATEGORIES } from "../api";
-
 export default function StatsBar({ stats }) {
   if (!stats) return null;
-  const byCategory = stats.products_by_category || {};
+  const byType = Object.entries(stats.items_by_type || {});
   const blocked = stats.jobs_by_status?.blocked || 0;
   return (
     <section className="stats" aria-label="Totals">
       <div className="stat">
-        <span className="stat-value">{stats.products}</span>
-        <span className="stat-label">Products</span>
+        <span className="stat-value">{stats.items}</span>
+        <span className="stat-label">Items</span>
       </div>
       <div className="stat">
         <span className="stat-value">{stats.sources}</span>
@@ -20,17 +18,17 @@ export default function StatsBar({ stats }) {
       </div>
       <div className="stat">
         <span className="stat-value">{blocked}</span>
-        <span className="stat-label">Blocked by compliance</span>
+        <span className="stat-label">Blocked by governance</span>
       </div>
       <div className="stat stat-wide">
-        <span className="stat-label">By category</span>
+        <span className="stat-label">Most common item types</span>
         <div className="chips">
-          {CATEGORIES.filter((c) => byCategory[c]).map((c) => (
-            <span key={c} className="chip">
-              {c} <strong>{byCategory[c]}</strong>
+          {byType.map(([type, count]) => (
+            <span key={type} className="chip">
+              {type} <strong>{count}</strong>
             </span>
           ))}
-          {!stats.products && <span className="muted small">No products yet</span>}
+          {!stats.items && <span className="muted small">No items yet</span>}
         </div>
       </div>
     </section>

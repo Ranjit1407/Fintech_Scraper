@@ -1,4 +1,4 @@
-"""A small fake bank website served through httpx.MockTransport."""
+"""A small fake website served through httpx.MockTransport."""
 
 import httpx
 
@@ -48,7 +48,7 @@ TERMS_PROHIBITED = "<html><body><h1>Terms of use</h1><p>" + (
 ) + "</p></body></html>"
 
 ROBOTS_OK = "User-agent: *\nDisallow: /private\n"
-ROBOTS_BLOCK_BOT = "User-agent: FintechScraperBot\nDisallow: /\n\nUser-agent: *\nAllow: /\n"
+ROBOTS_BLOCK_BOT = "User-agent: WebScraperBot\nDisallow: /\n\nUser-agent: *\nAllow: /\n"
 
 
 def make_transport(robots: str = ROBOTS_OK, terms: str = TERMS_OK, cards_status: int = 200) -> httpx.MockTransport:

@@ -121,9 +121,10 @@ def test_document_job_runs_the_pipeline():
     assert job.fetch_method == "document"
     checks = {c["name"]: c["status"] for c in job.compliance["checks"]}
     assert checks == {"local_document": "pass", "personal_data": "pass"}
-    names = {p.name for p in job.products}
+    names = {i.name for i in job.items}
     assert {"12-Month CD", "60-Month CD"} <= names
-    twelve = next(p for p in job.products if p.name == "12-Month CD")
+    twelve = next(i for i in job.items if i.name == "12-Month CD")
+    assert twelve.data["attributes"]["APY"] == "4.35%"
     assert twelve.references[0].url == path.resolve().as_uri()
     assert job.source.domain == "local-documents"
 
@@ -188,7 +189,7 @@ def test_upload_review_then_process():
         assert len(jobs) == 3
         details = [client.get(f"/api/jobs/{j['id']}").json() for j in jobs]
         assert all(d["status"] == "completed" for d in details)
-        assert any(p["name"] == "12-Month CD" for d in details for p in d["products"])
+        assert any(i["name"] == "12-Month CD" for d in details for i in d["items"])
 
         # processed uploads can be neither re-processed nor deleted
         assert client.post(f"/api/uploads/{batch['batch_id']}/process", json={}).status_code == 409

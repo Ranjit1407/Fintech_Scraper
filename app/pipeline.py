@@ -11,44 +11,36 @@ from urllib.parse import urlsplit
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.ai.classification import get_classifier
-from app.ai.extraction import extract_products, merge_part_products, same_product
+from app.ai.extraction import extract_items, merge_part_items, same_item
+from app.ai.keywords import keyword_findings, tag_items
 from app.ai.llm_client import LLMClient
 from app.ai.rag import RagIndex, build_index, load_rag_config, source_length, split_parts
-from app.ai.summarization import REPORT_QUESTIONS, part_notes, report_context, summarize_page, summarize_products
+from app.ai.summarization import REPORT_QUESTIONS, part_notes, report_context, summarize_page
 from app.ai.webpage_understanding import understand_page
 from app.compliance.checker import ComplianceOutcome, run_compliance_checks
 from app.compliance.pii import check_pii, get_pii_detector
 from app.config import Settings, get_settings
 from app.database.database import SessionLocal
-from app.database.models import (
-    DocumentChunk,
-    ExtractionResult,
-    Product,
-    ProductAttribute,
-    ScrapeJob,
-    Source,
-    SourceReference,
-)
+from app.database.models import DocumentChunk, ExtractionResult, Item, ItemReference, ScrapeJob, Source
 from app.documents.loader import load_document
 from app.scraper.browser_scraper import BrowserUnavailable, fetch_rendered, needs_browser
 from app.scraper.http_scraper import FetchResult, HttpScraper
 from app.scraper.parser import ParsedPage, _table_lines, parse_html, parse_json_payload
-from app.validation.grounding import PageEvidence, ground_product, ground_report
-from app.validation.merge import merge_product, merge_reports
+from app.validation.grounding import PageEvidence, ground_item, ground_report
+from app.validation.merge import merge_item, merge_reports
 from app.validation.schemas import (
     CheckStatus,
     ComplianceCheck,
     ComplianceReport,
     DataType,
     DocumentJobRequest,
-    ExtractedProduct,
+    ExtractedItem,
     JobStatus,
     PageReport,
     PageUnderstanding,
-    RejectedProduct,
+    RejectedItem,
     ScrapeRequest,
-    validate_products,
+    validate_items,
 )
 
 log = logging.getLogger(__name__)
@@ -109,15 +101,20 @@ async def run_job(
         db.close()
 
 
+def _report_checks(report: ComplianceReport, emit: Callable[..., None]) -> None:
+    for check in report.checks:
+        level = {"fail": "error", "warn": "warn"}.get(check.status.value, "info")
+        emit("compliance", f"{check.name}: {check.status.value.upper()} — {check.summary}", level)
+
+
 async def _execute(db: Session, job: ScrapeJob, scraper: HttpScraper, llm: LLMClient, settings: Settings) -> None:
     request = ScrapeRequest.model_validate(job.request)
     url = str(request.url)
-    data_types = set(request.data_types)
 
     def emit(stage: str, message: str, level: str = "info") -> None:
         _event(db, job, stage, message, level)
 
-    emit("compliance", "Running compliance checks")
+    emit("compliance", "Running governance checks")
     outcome = await run_compliance_checks(
         url, scraper, api_endpoint=str(request.api_endpoint) if request.api_endpoint else None, llm=llm
     )
@@ -126,9 +123,7 @@ async def _execute(db: Session, job: ScrapeJob, scraper: HttpScraper, llm: LLMCl
     source = _get_or_create_source(db, url)
     job.source = source
     source.api_available = bool(report.api and report.api.available)
-    for check in report.checks:
-        level = {"fail": "error", "warn": "warn"}.get(check.status.value, "info")
-        emit("compliance", f"{check.name}: {check.status.value.upper()} — {check.summary}", level)
+    _report_checks(report, emit)
 
     if not report.allowed:
         job.status = JobStatus.BLOCKED.value
@@ -146,11 +141,12 @@ async def _execute(db: Session, job: ScrapeJob, scraper: HttpScraper, llm: LLMCl
     else:
         page = await asyncio.to_thread(parse_html, fetched.text, fetched.final_url)
     emit("extraction", f"{len(page.blocks)} text blocks, {len(page.tables)} tables, "
-                       f"{len(page.figures)} financial figures, {len(page.json_ld)} JSON-LD items")
+                       f"{len(page.figures)} figures, {len(page.json_ld)} JSON-LD items")
     emit("cleaning", f"Removed {page.stats.get('noise_elements_removed', 0)} noise elements (scripts, navigation, "
                      f"ads, banners) and {page.stats.get('duplicate_blocks_removed', 0)} duplicate/boilerplate "
                      f"text blocks")
-    await _process(db, job, source, page, fetched.final_url, data_types, llm, settings, emit)
+    await _process(db, job, source, page, fetched.final_url, set(request.data_types), request.keywords,
+                   llm, settings, emit)
 
 
 async def _execute_document(db: Session, job: ScrapeJob, llm: LLMClient, settings: Settings) -> None:
@@ -165,7 +161,7 @@ async def _execute_document(db: Session, job: ScrapeJob, llm: LLMClient, setting
     page = await asyncio.to_thread(load_document, path, settings.max_document_bytes)
     job.fetch_method = "document"
     emit("extraction", f"{len(page.blocks)} text blocks, {len(page.tables)} tables, "
-                       f"{len(page.figures)} financial figures from {page.metadata.get('file_type', '').upper()} file")
+                       f"{len(page.figures)} figures from {page.metadata.get('file_type', '').upper()} file")
 
     pii = await asyncio.to_thread(check_pii, page.text + "\n" + _table_lines(page.tables), get_pii_detector(),
                                   settings.pii_block_threshold)
@@ -176,15 +172,13 @@ async def _execute_document(db: Session, job: ScrapeJob, llm: LLMClient, setting
     job.compliance = report.model_dump(mode="json")
     source = _get_or_create_source(db, page.url)
     job.source = source
-    for check in report.checks:
-        level = {"fail": "error", "warn": "warn"}.get(check.status.value, "info")
-        emit("compliance", f"{check.name}: {check.status.value.upper()} — {check.summary}", level)
+    _report_checks(report, emit)
     if not report.allowed:
         job.status = JobStatus.BLOCKED.value
         job.error = "; ".join(report.blocked_reasons)[:2000]
         emit("compliance", "BLOCKED — document not processed", "error")
         return
-    await _process(db, job, source, page, page.url, set(request.data_types), llm, settings, emit)
+    await _process(db, job, source, page, page.url, set(request.data_types), request.keywords, llm, settings, emit)
 
 
 async def _process(
@@ -194,10 +188,12 @@ async def _process(
     page: ParsedPage,
     source_url: str,
     data_types: set[DataType],
+    keywords: list[str],
     llm: LLMClient,
     settings: Settings,
     emit: Callable[..., None],
 ) -> None:
+    """Shared stages for web pages and documents."""
     redactions = await asyncio.to_thread(page.redact, get_pii_detector().redact)
     if redactions:
         emit("cleaning", f"Redacted {redactions} personal-data item(s) before AI processing")
@@ -205,77 +201,69 @@ async def _process(
     max_chars = llm.max_input_chars
     understanding = await understand_page(page, llm, max_chars)
     source.title = page.title[:500]
-    source.institution = (understanding.institution or "")[:255] or None
-    emit("understanding", f"Page type: {understanding.page_type}; institution: "
-                          f"{understanding.institution or 'unknown'} (via {understanding.method})")
+    source.publisher = (understanding.publisher or "")[:255] or None
+    emit("understanding", f"Page type: {understanding.page_type}; publisher: "
+                          f"{understanding.publisher or 'unknown'} (via {understanding.method})")
 
     # A source longer than one prompt is read in parts so that nothing is cut off, and it is
     # indexed for retrieval so the report can draw on the most relevant passages.
+    rag_config = load_rag_config(settings)
     parts = split_parts(page, max_chars) if llm.enabled and source_length(page) > max_chars else [page]
     index: RagIndex | None = None
     if len(parts) > 1:
-        rag_config = load_rag_config(settings)
         emit("rag", f"Long source ({len(page.text):,} characters): reading all of it in {len(parts)} parts")
         index = await build_index(page, REPORT_QUESTIONS, rag_config)
         emit("rag", f"Indexed {len(index.chunks)} chunks with {index.method} for retrieval")
 
-    if len(parts) == 1:
-        raw_products, extraction_method = await extract_products(page, understanding, llm, max_chars)
-    else:
-        found, methods = [], set()
-        for number, part in enumerate(parts, 1):
-            emit("extraction", f"Extracting products from part {number} of {len(parts)}")
-            products, method = await extract_products(part, understanding, llm, max_chars)
-            found.append(products)
-            methods.add(method)
-        raw_products = merge_part_products(found)
-        extraction_method = f"{'+'.join(sorted(methods))} over {len(parts)} parts"
-    emit("extraction", f"{len(raw_products)} candidate product(s) extracted via {extraction_method}")
-
-    classifier = get_classifier(settings.classifier_model_path)
-    for item in raw_products:
-        if isinstance(item, dict):
-            result = classifier.classify(item)
-            item.update(category=result.category.value, category_confidence=result.confidence,
-                        classification_method=result.method)
-    categories = sorted({str(p.get("category")) for p in raw_products if isinstance(p, dict)})
-    emit("classification", f"Categories: {', '.join(categories) or 'none'}")
-
     evidence = PageEvidence.from_page(page)
-    unverified_total = 0
-    for item in raw_products:
-        if isinstance(item, dict):
-            ground_product(item, evidence)
-            unverified_total += len(item["unverified"])
-    if unverified_total:
-        emit("validation", f"Removed {unverified_total} fact(s) not supported by the page "
-                           f"(see each product's 'unverified' list)", "warn")
-    valid, rejected = validate_products(
-        raw_products, source_url=source_url, min_confidence=settings.min_product_confidence,
-        data_types=data_types,
-    )
-    emit("validation", f"{len(valid)} product(s) valid, {len(rejected)} rejected",
-         "warn" if rejected and not valid else "info")
+    raw_items: list = []
+    valid: list[ExtractedItem] = []
+    rejected: list[RejectedItem] = []
+    if DataType.ITEMS in data_types:
+        raw_items, method = await _extract(page, parts, understanding, llm, max_chars, keywords, emit)
+        emit("extraction", f"{len(raw_items)} candidate item(s) extracted via {method}")
+        unverified_total = 0
+        for raw in raw_items:
+            if isinstance(raw, dict):
+                ground_item(raw, evidence)
+                unverified_total += len(raw["unverified"])
+        if unverified_total:
+            emit("validation", f"Removed {unverified_total} fact(s) not supported by the source "
+                               f"(see each item's 'unverified' list)", "warn")
+        valid, rejected = validate_items(raw_items, source_url=source_url,
+                                         min_confidence=settings.min_item_confidence)
+        emit("validation", f"{len(valid)} item(s) valid, {len(rejected)} rejected",
+             "warn" if rejected and not valid else "info")
+    else:
+        emit("extraction", "Item extraction skipped: items were not selected")
+
+    if keywords:
+        valid = tag_items(valid, keywords)
+        emit("keywords", f"{sum(1 for i in valid if i.matched_keywords)} item(s) mention your keywords")
 
     updating = bool((job.request or {}).get("update")) and job.extraction is not None
     previous_report = job.extraction.page_report if updating else None
-    rows, stored, merged = _store(db, job, source, page, valid, rejected, understanding, raw_products, data_types, llm)
+    rows, merged = _store(db, job, source, page, valid, rejected, understanding, raw_items, data_types, llm)
     if updating:
-        emit("storage", f"Updated existing results: {merged} product(s) merged with new facts, "
-                        f"{len(rows) - merged} new product(s) added, {len(job.products) - len(rows)} kept unchanged")
+        emit("storage", f"Updated existing results: {merged} item(s) merged with new facts, "
+                        f"{len(rows) - merged} new item(s) added, {len(job.items) - len(rows)} kept unchanged")
     else:
-        emit("storage", f"Stored {len(rows)} product(s) with source references")
+        emit("storage", f"Stored {len(rows)} item(s) with source references")
 
-    summaries = await summarize_products(stored, llm)
-    for row, summary in zip(rows, summaries):
-        row.summary = summary.model_dump(mode="json")
-    if summaries:
-        emit("summarization", f"Summarised {len(summaries)} product(s) via {summaries[0].method}")
+    findings = []
+    if keywords:
+        emit("keywords", f"Searching the whole source for: {', '.join(keywords)}")
+        findings = await keyword_findings(page, keywords, valid, llm, rag_config, max_chars)
+        for finding in findings:
+            exact = sum(1 for p in finding.passages if p.match == "exact")
+            related = len(finding.passages) - exact
+            emit("keywords", f"'{finding.keyword}': {exact} exact and {related} related passage(s), "
+                             f"{len(finding.items)} item(s)", "info" if finding.found else "warn")
 
-    emit("report", f"Writing page report via {llm.model_name}" if llm.enabled else "Writing page report")
+    emit("report", f"Writing the report via {llm.model_name}" if llm.enabled else "Writing the report")
     content = None
+    notes: list[list[str]] = []
     if index is not None:
-        notes = []
         for number, part in enumerate(parts, 1):
             emit("report", f"Reading part {number} of {len(parts)} for the summary")
             notes.append(await part_notes(part, number, len(parts), llm, max_chars))
@@ -291,8 +279,7 @@ async def _process(
         emit("rag", f"Summary input: {sum(len(n) for n in notes)} notes from all {len(parts)} parts and "
                     f"{len(passages)} retrieved passages")
     report = await summarize_page(page, understanding, valid, llm, max_chars, content=content)
-    if index is not None:
-        report = report.model_copy(update={"part_notes": notes})
+    report = report.model_copy(update={"part_notes": notes, "keyword_findings": findings})
     report, dropped = ground_report(report, evidence)
     words = len(report.detailed_summary.split())
     emit("report", f"Detailed information: {len(report.sections)} section(s), {len(report.key_figures)} key "
@@ -304,9 +291,9 @@ async def _process(
         emit("report", "Merged the new report with the earlier findings for this document")
     job.extraction.page_report = report.model_dump(mode="json")
     if report.method == "llm":
-        emit("report", f"Page report written by {report.model}: {report.headline}")
+        emit("report", f"Report written by {report.model}: {report.headline}")
     elif llm.enabled:
-        emit("report", "LLM page report failed; stored a basic extractive summary instead", "warn")
+        emit("report", "LLM report failed; stored a basic extractive summary instead", "warn")
     else:
         emit("report", "LLM not configured (choose a profile in config/llm.toml and set its API key in .env); "
                        "stored a basic extractive summary instead", "warn")
@@ -314,6 +301,26 @@ async def _process(
     source.last_scraped_at = _now()
     job.status = JobStatus.COMPLETED.value
     emit("done", "Pipeline completed")
+
+
+async def _extract(
+    page: ParsedPage,
+    parts: list[ParsedPage],
+    understanding: PageUnderstanding,
+    llm: LLMClient,
+    max_chars: int,
+    keywords: list[str],
+    emit: Callable[..., None],
+) -> tuple[list, str]:
+    if len(parts) == 1:
+        return await extract_items(page, understanding, llm, max_chars, keywords)
+    found, methods = [], set()
+    for number, part in enumerate(parts, 1):
+        emit("extraction", f"Extracting items from part {number} of {len(parts)}")
+        items, method = await extract_items(part, understanding, llm, max_chars, keywords)
+        found.append(items)
+        methods.add(method)
+    return merge_part_items(found), f"{'+'.join(sorted(methods))} over {len(parts)} parts"
 
 
 async def _route_and_fetch(
@@ -374,47 +381,24 @@ def _get_or_create_source(db: Session, url: str) -> Source:
     return source
 
 
-def _attributes_for(product: ExtractedProduct) -> list[ProductAttribute]:
-    attrs: list[ProductAttribute] = []
-    for rate in product.rates:
-        attrs.append(ProductAttribute(kind="rate", name=rate.label, value=rate.display(),
-                                      numeric_value=rate.value if rate.value is not None else rate.min, unit="%"))
-    for fee in product.fees:
-        attrs.append(ProductAttribute(kind="fee", name=fee.label, value=fee.display(),
-                                      numeric_value=fee.amount if fee.amount is not None else fee.percentage,
-                                      unit=fee.currency or ("%" if fee.percentage is not None else None)))
-    for name in ("min_amount", "max_amount"):
-        value = getattr(product, name)
-        if value is not None:
-            attrs.append(ProductAttribute(kind="amount", name=name, value=f"{value:g}", numeric_value=value,
-                                          unit=product.currency))
-    if product.tenure:
-        attrs.append(ProductAttribute(kind="tenure", name="tenure", value=product.tenure))
-    for kind, values in (("eligibility", product.eligibility), ("feature", product.features),
-                         ("condition", product.conditions)):
-        attrs.extend(ProductAttribute(kind=kind, name=kind, value=v) for v in values)
-    attrs.extend(ProductAttribute(kind="attribute", name=k, value=v) for k, v in product.attributes.items())
-    return attrs
-
-
 def _store(
     db: Session,
     job: ScrapeJob,
     source: Source,
     page: ParsedPage,
-    valid: list[ExtractedProduct],
-    rejected: list[RejectedProduct],
+    valid: list[ExtractedItem],
+    rejected: list[RejectedItem],
     understanding: PageUnderstanding,
-    raw_products: list,
+    raw_items: list,
     data_types: set[DataType],
     llm: LLMClient,
-) -> tuple[list[Product], list[ExtractedProduct], int]:
-    # A re-upload updates the job in place: matching products are merged and nothing stored earlier is removed.
-    # Returns (rows written, their product data, how many were merged into existing products).
+) -> tuple[list[Item], int]:
+    # A re-upload updates the job in place: matching items are merged and nothing stored earlier is removed.
+    # Returns (rows written, how many were merged into existing items).
     now = _now()
     values = dict(
         understanding=understanding.model_dump(mode="json"),
-        raw_products=[p for p in raw_products if isinstance(p, dict)],
+        raw_items=[i for i in raw_items if isinstance(i, dict)],
         rejected=[r.model_dump() for r in rejected],
         tables=[asdict(t) for t in page.tables] if DataType.TABLES in data_types else None,
         text=page.text[:100_000] if DataType.TEXT in data_types else None,
@@ -428,32 +412,26 @@ def _store(
     else:
         for key, value in values.items():
             setattr(job.extraction, key, value)
-    job.chunks = []  # re-indexed below when the source is long
+    job.chunks = []  # re-indexed later when the source is long
 
-    rows: list[Product] = []
-    stored: list[ExtractedProduct] = []
+    rows: list[Item] = []
     merged_count = 0
-    for product in valid:
-        row = next((p for p in job.products if same_product(p.name, product.name)), None)
+    for item in valid:
+        row = next((i for i in job.items if same_item(i.name, item.name)), None)
         if row is None:
-            row = Product(job=job, name=product.name)
+            row = Item(job=job, name=item.name)
             db.add(row)
         else:
-            product = merge_product(ExtractedProduct.model_validate(row.data), product)
+            item = merge_item(ExtractedItem.model_validate(row.data), item)
             merged_count += 1
         row.source = source
-        row.provider = (product.provider or "")[:255] or None
-        row.category = product.category.value
-        row.category_confidence = product.category_confidence
-        row.classification_method = product.classification_method
-        row.description = product.description
-        row.confidence = product.confidence
-        row.extraction_method = product.extraction_method
-        row.data = product.model_dump(mode="json")
-        row.attributes = _attributes_for(product)
-        row.references = [*row.references, SourceReference(url=str(product.source_url), snippet=product.source_snippet,
-                                                             content_hash=page.content_hash, retrieved_at=now)]
+        row.type = item.type
+        row.description = item.description
+        row.confidence = item.confidence
+        row.extraction_method = item.extraction_method
+        row.data = item.model_dump(mode="json")
+        row.references = [*row.references, ItemReference(url=str(item.source_url), snippet=item.source_snippet,
+                                                         content_hash=page.content_hash, retrieved_at=now)]
         rows.append(row)
-        stored.append(product)
     db.commit()
-    return rows, stored, merged_count
+    return rows, merged_count

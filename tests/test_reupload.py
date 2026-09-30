@@ -3,8 +3,8 @@ from fastapi.testclient import TestClient
 from app.database.database import SessionLocal
 from app.database.models import ScrapeJob
 from app.main import app
-from app.validation.merge import merge_product, merge_reports
-from app.validation.schemas import ExtractedProduct, PageReport
+from app.validation.merge import merge_item, merge_reports
+from app.validation.schemas import ExtractedItem, KeywordFinding, PageReport
 
 V1 = b"""# Zeta Bank CD Rates
 
@@ -28,9 +28,9 @@ def _upload_and_process(client, content, name="reupload/zeta-rates.md"):
     return batch, jobs
 
 
-def _products(client, job_id):
+def _items(client, job_id):
     detail = client.get(f"/api/jobs/{job_id}").json()
-    return detail, {p["name"]: p for p in detail["products"]}
+    return detail, {i["name"]: i for i in detail["items"]}
 
 
 def test_reupload_asks_and_merges_into_the_existing_job():
@@ -38,29 +38,28 @@ def test_reupload_asks_and_merges_into_the_existing_job():
         batch, jobs = _upload_and_process(client, V1)
         assert batch["files"][0]["previous"] is None
         job_id = jobs[0]["id"]
-        detail, products = _products(client, job_id)
+        detail, items = _items(client, job_id)
         assert detail["status"] == "completed", detail["error"]
-        assert {"Zeta 6-Month CD", "Zeta 12-Month CD"} <= set(products)
+        assert {"Zeta 6-Month CD", "Zeta 12-Month CD"} <= set(items)
 
         # identical re-upload: flagged, then processed into the same job without duplicates
         batch, jobs = _upload_and_process(client, V1)
         previous = batch["files"][0]["previous"]
         assert previous["job_id"] == job_id and previous["match"] == "identical"
         assert [j["id"] for j in jobs] == [job_id]
-        detail, again = _products(client, job_id)
+        detail, again = _items(client, job_id)
         assert detail["status"] == "completed" and detail["updated_at"]
-        assert sorted(again) == sorted(products)
+        assert sorted(again) == sorted(items)
         assert len(again["Zeta 12-Month CD"]["references"]) == 2
         assert any(e["stage"] == "update" for e in detail["events"])
 
-        # new version with the same name: changed rate replaced, new product added, old one kept
+        # new version with the same name: changed value replaced, new item added, old one kept
         batch, jobs = _upload_and_process(client, V2)
         assert batch["files"][0]["previous"]["match"] == "same_name"
         assert [j["id"] for j in jobs] == [job_id]
-        detail, merged = _products(client, job_id)
+        detail, merged = _items(client, job_id)
         assert {"Zeta 6-Month CD", "Zeta 12-Month CD", "Zeta 36-Month CD"} <= set(merged)
-        twelve = [r["value"] for r in merged["Zeta 12-Month CD"]["data"]["rates"]]
-        assert 4.5 in twelve and 4.35 not in twelve
+        assert merged["Zeta 12-Month CD"]["data"]["attributes"]["APY"] == "4.50%"
         assert len(merged["Zeta 12-Month CD"]["references"]) == 3
         assert len(detail["request"]["previous_files"]) == 2
         assert any("merged with new facts" in e["message"] for e in detail["events"])
@@ -84,22 +83,24 @@ def test_reupload_refused_while_the_document_is_processing():
 
 
 def test_merge_rules():
-    old = ExtractedProduct(name="Card", source_url="https://a.example/",
-                           rates=[{"label": "APR", "value": 20.0}, {"label": "Cash APR", "value": 25.0}],
-                           features=["Cashback"], tenure="12 months")
-    new = ExtractedProduct(name="Card", source_url="https://a.example/v2",
-                           rates=[{"label": "apr", "value": 18.0}], features=["cashback", "Lounge access"])
-    merged = merge_product(old, new)
-    assert [(r.label, r.value) for r in merged.rates] == [("Cash APR", 25.0), ("apr", 18.0)]
-    assert merged.features == ["Cashback", "Lounge access"] and merged.tenure == "12 months"
+    old = ExtractedItem(name="Card", source_url="https://a.example/", description="A rewards card.",
+                        attributes={"APR": "20%", "Cash APR": "25%"}, matched_keywords=["fees"])
+    new = ExtractedItem(name="Card", source_url="https://a.example/v2",
+                        attributes={"apr": "18%", "Lounge": "Included"}, matched_keywords=["lounge"])
+    merged = merge_item(old, new)
+    assert merged.attributes == {"Cash APR": "25%", "apr": "18%", "Lounge": "Included"}
+    assert merged.description == "A rewards card." and merged.matched_keywords == ["fees", "lounge"]
     assert str(merged.source_url) == "https://a.example/v2"
 
     report = merge_reports(
         PageReport(headline="Old", key_points=["A"], key_figures=[{"label": "PAT", "value": "Rs10bn"}],
-                   sections=[{"title": "Intro", "summary": "Old intro."}]),
+                   sections=[{"title": "Intro", "summary": "Old intro."}],
+                   keyword_findings=[KeywordFinding(keyword="Profit"), KeywordFinding(keyword="staff")]),
         PageReport(headline="New", key_points=["B", "a"], key_figures=[{"label": "pat", "value": "Rs12bn"}],
-                   sections=[{"title": "Outlook", "summary": "New outlook."}]),
+                   sections=[{"title": "Outlook", "summary": "New outlook."}],
+                   keyword_findings=[KeywordFinding(keyword="profit", found=True)]),
     )
     assert report.headline == "New" and report.key_points == ["B", "a"]
     assert [f.value for f in report.key_figures] == ["Rs12bn"]
     assert [s.title for s in report.sections] == ["Outlook", "Intro"]
+    assert [(f.keyword, f.found) for f in report.keyword_findings] == [("profit", True), ("staff", False)]

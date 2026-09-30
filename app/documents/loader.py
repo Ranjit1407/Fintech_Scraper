@@ -18,7 +18,7 @@ from app.scraper.parser import (
     TextBlock,
     _table_lines,
     deduplicate,
-    find_financial_figures,
+    find_figures,
     frame_to_table,
     parse_html,
 )
@@ -100,7 +100,7 @@ def _make_page(uri: str, title: str, blocks: list[TextBlock], tables: list[Extra
         json_ld=[],
         blocks=deduped,
         tables=tables,
-        figures=find_financial_figures(body + "\n" + _table_lines(tables)),
+        figures=find_figures(body + "\n" + _table_lines(tables)),
         content_hash=hashlib.sha256(raw).hexdigest(),
         stats={"duplicate_blocks_removed": len(blocks) - len(deduped), "tables": len(tables)},
     )

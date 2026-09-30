@@ -38,13 +38,14 @@ def _profiles_command(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _create_jobs(args: argparse.Namespace, data_types: list[DataType]) -> list[str] | int:
+def _create_jobs(args: argparse.Namespace, data_types: list[DataType], keywords: list[str]) -> list[str] | int:
     settings = get_settings()
     requests: list[tuple[str, dict]] = []
     if args.url:
         url = args.url if "://" in args.url else f"https://{args.url}"
         try:
-            request = ScrapeRequest(url=url, data_types=data_types, render_mode=args.render, llm_profile=args.profile)
+            request = ScrapeRequest(url=url, keywords=keywords, data_types=data_types, render_mode=args.render,
+                                    llm_profile=args.profile)
         except ValidationError as exc:
             return _fail(f"invalid URL {args.url!r}: {exc.errors()[0]['msg']}")
         requests.append((str(request.url), request.model_dump(mode="json")))
@@ -58,7 +59,8 @@ def _create_jobs(args: argparse.Namespace, data_types: list[DataType]) -> list[s
             return _fail(f"no supported documents in {folder}")
         print(f"Found {len(files)} document(s) in {folder}")
         for path in files:
-            request = DocumentJobRequest(document_path=str(path), data_types=data_types, llm_profile=args.profile)
+            request = DocumentJobRequest(document_path=str(path), keywords=keywords, data_types=data_types,
+                                         llm_profile=args.profile)
             requests.append((path.as_uri(), request.model_dump(mode="json")))
 
     with SessionLocal() as db:
@@ -71,11 +73,23 @@ def _create_jobs(args: argparse.Namespace, data_types: list[DataType]) -> list[s
 def _print_job(job: ScrapeJob) -> None:
     print(f"\n=== {job.url}")
     print(f"status: {job.status}" + (f"  ({job.error})" if job.error else ""))
-    for product in job.products:
-        unverified = product.data.get("unverified") or []
-        note = f", {len(unverified)} unsupported fact(s) removed" if unverified else ""
-        print(f"  - {product.name} [{product.category}] confidence {product.confidence:.2f}{note}")
     report = job.extraction.page_report if job.extraction else None
+    for finding in (report or {}).get("keyword_findings") or []:
+        passages = finding.get("passages") or []
+        exact = sum(1 for p in passages if p.get("match") == "exact")
+        print(f"  keyword '{finding['keyword']}': "
+              + (f"{exact} exact, {len(passages) - exact} related passage(s)" if passages else "not found"))
+        if finding.get("summary"):
+            print(f"    {finding['summary']}")
+        for point in (finding.get("points") or [])[:5]:
+            print(f"    - {point}")
+    items = sorted(job.items, key=lambda i: not i.data.get("matched_keywords"))
+    for item in items:
+        unverified = item.data.get("unverified") or []
+        matched = item.data.get("matched_keywords") or []
+        note = (f", matches {', '.join(matched)}" if matched else "") + (
+            f", {len(unverified)} unsupported fact(s) removed" if unverified else "")
+        print(f"  - {item.name} [{item.type}] confidence {item.confidence:.2f}{note}")
     if report:
         print(f"  report ({report.get('model') or 'extractive, no LLM'}): {report.get('headline') or ''}")
         if report.get("overview"):
@@ -100,7 +114,11 @@ def _run_command(args: argparse.Namespace) -> int:
         data_types = [DataType(t.strip()) for t in args.data_types.split(",")] if args.data_types else list(DataType)
     except ValueError:
         return _fail(f"--data-types must be a comma-separated subset of {', '.join(t.value for t in DataType)}")
-    job_ids = _create_jobs(args, data_types)
+    try:
+        keywords = ScrapeRequest.model_validate({"url": "https://example.com", "keywords": args.keywords or []}).keywords
+    except ValidationError as exc:
+        return _fail(f"--keywords: {exc.errors()[0]['msg'].removeprefix('Value error, ')}")
+    job_ids = _create_jobs(args, data_types, keywords)
     if isinstance(job_ids, int):
         return job_ids
 
@@ -131,9 +149,10 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
 
     run = commands.add_parser("run", help="collect and extract data from a website and/or documents")
-    run.add_argument("--url", help="website page to scrape, e.g. https://example-bank.com/credit-cards")
+    run.add_argument("--url", help="web page to scrape, e.g. https://example.com/pricing")
     run.add_argument("--docs", help="folder of PDF, DOCX, TXT, MD or HTML documents")
     run.add_argument("--recursive", action="store_true", help="include documents in sub-folders")
+    run.add_argument("--keywords", help='comma-separated keywords to look for first, e.g. "pricing, refund policy"')
     run.add_argument("--profile", help="LLM profile from config/llm.toml (default: active profile)")
     run.add_argument("--data-types", help="comma-separated: " + ",".join(t.value for t in DataType))
     run.add_argument("--render", choices=["auto", "http", "browser"], default="auto", help="website rendering")
