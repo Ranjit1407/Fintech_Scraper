@@ -10,7 +10,7 @@
 # Free OpenRouter models change over time; the current list is at
 # https://openrouter.ai/models?max_price=0 (pick ones that support "response_format").
 
-active_profile = "ollama-local"
+active_profile = "gemma-4-26b-moe"
 
 # Retrieval-augmented generation for sources longer than one prompt (max_input_chars):
 # every part is read for products and notes, and the summary is written from those notes plus
@@ -19,9 +19,25 @@ active_profile = "ollama-local"
 chunk_chars = 1500                 # size of each indexed chunk
 top_k = 3                          # passages retrieved per report question
 embedding_provider = "ollama"      # ollama | tfidf (tfidf needs no model; also the fallback)
-embedding_model = "bge-m3"         # run: ollama pull bge-m3
+embedding_model = "bge-m3"         # any Ollama embedding model; run: ollama pull <embedding_model>
 embedding_base_url = "http://localhost:11434"
 embedding_timeout = 180
+
+# Address of each provider's API. A profile's own base_url (or LLM_BASE_URL in .env) takes precedence.
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+
+[providers.gemini]
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+[providers.qwen]
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
+[providers.ollama]
+base_url = "http://localhost:11434"
 
 # Applied to every profile unless the profile sets its own value.
 [defaults]

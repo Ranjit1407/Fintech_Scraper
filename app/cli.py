@@ -1,4 +1,4 @@
-"""Run the pipeline on a website URL and/or a folder of documents."""
+"""Run the pipeline on a website URL."""
 
 from __future__ import annotations
 
@@ -14,9 +14,8 @@ from app.ai.llm_client import list_llm_profiles, llm_status, load_llm_profiles
 from app.config import get_settings, setup_logging
 from app.database.database import SessionLocal, init_db
 from app.database.models import ScrapeJob
-from app.documents.loader import DocumentError, list_documents, resolve_folder
 from app.pipeline import run_job
-from app.validation.schemas import DataType, DocumentJobRequest, JobStatus, ScrapeRequest
+from app.validation.schemas import DataType, JobStatus, ScrapeRequest
 
 
 def _fail(message: str) -> int:
@@ -39,29 +38,13 @@ def _profiles_command(_args: argparse.Namespace) -> int:
 
 
 def _create_jobs(args: argparse.Namespace, data_types: list[DataType], keywords: list[str]) -> list[str] | int:
-    settings = get_settings()
-    requests: list[tuple[str, dict]] = []
-    if args.url:
-        url = args.url if "://" in args.url else f"https://{args.url}"
-        try:
-            request = ScrapeRequest(url=url, keywords=keywords, data_types=data_types, render_mode=args.render,
-                                    llm_profile=args.profile)
-        except ValidationError as exc:
-            return _fail(f"invalid URL {args.url!r}: {exc.errors()[0]['msg']}")
-        requests.append((str(request.url), request.model_dump(mode="json")))
-    if args.docs:
-        try:
-            folder = resolve_folder(args.docs, settings)
-        except DocumentError as exc:
-            return _fail(str(exc))
-        files = list_documents(folder, recursive=args.recursive, limit=settings.max_documents_per_folder)
-        if not files:
-            return _fail(f"no supported documents in {folder}")
-        print(f"Found {len(files)} document(s) in {folder}")
-        for path in files:
-            request = DocumentJobRequest(document_path=str(path), keywords=keywords, data_types=data_types,
-                                         llm_profile=args.profile)
-            requests.append((path.as_uri(), request.model_dump(mode="json")))
+    url = args.url if "://" in args.url else f"https://{args.url}"
+    try:
+        request = ScrapeRequest(url=url, keywords=keywords, data_types=data_types, render_mode=args.render,
+                                llm_profile=args.profile)
+    except ValidationError as exc:
+        return _fail(f"invalid URL {args.url!r}: {exc.errors()[0]['msg']}")
+    requests: list[tuple[str, dict]] = [(str(request.url), request.model_dump(mode="json"))]
 
     with SessionLocal() as db:
         jobs = [ScrapeJob(url=url, request=body, status=JobStatus.QUEUED.value, events=[]) for url, body in requests]
@@ -97,8 +80,6 @@ def _print_job(job: ScrapeJob) -> None:
 
 
 def _run_command(args: argparse.Namespace) -> int:
-    if not args.url and not args.docs:
-        return _fail("give --url, --docs or both")
     settings = get_settings()
     setup_logging(settings)
     init_db()
@@ -148,10 +129,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli", description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
 
-    run = commands.add_parser("run", help="collect and extract data from a website and/or documents")
-    run.add_argument("--url", help="web page to scrape, e.g. https://example.com/pricing")
-    run.add_argument("--docs", help="folder of PDF, DOCX, TXT, MD or HTML documents")
-    run.add_argument("--recursive", action="store_true", help="include documents in sub-folders")
+    run = commands.add_parser("run", help="collect and extract data from a website")
+    run.add_argument("--url", required=True, help="web page to scrape, e.g. https://example.com/pricing")
     run.add_argument("--keywords", help='comma-separated keywords to look for first, e.g. "pricing, refund policy"')
     run.add_argument("--profile", help="LLM profile from config/llm.toml (default: active profile)")
     run.add_argument("--data-types", help="comma-separated: " + ",".join(t.value for t in DataType))

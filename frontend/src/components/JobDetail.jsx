@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { api, formatTime, isActive, isDocument, sourceLabel } from "../api";
+import { api, formatTime, isActive } from "../api";
 import ComplianceTable from "./ComplianceTable";
+import CopyButton from "./CopyButton";
 import ItemCard from "./ItemCard";
 import KeywordResults from "./KeywordResults";
 import PageReport from "./PageReport";
@@ -26,34 +27,102 @@ function ItemList({ title, items, empty }) {
   );
 }
 
-export default function JobDetail({ jobId, onChange }) {
+export default function JobDetail({ jobId, onChange, onOpen }) {
   const [job, setJob] = useState(null);
   const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(null);
 
   useEffect(() => {
-    let cancelled = false;
+    let stopped = false;
+    let stream;
     let timer;
+
     const load = async () => {
-      try {
-        const data = await api.getJob(jobId);
-        if (cancelled) return;
+      const data = await api.getJob(jobId);
+      if (!stopped) {
         setJob(data);
         setError(null);
-        if (isActive(data.status)) timer = setTimeout(load, 2000);
+      }
+      return data;
+    };
+
+    // Used when the event stream cannot get through, for instance behind a proxy that buffers it.
+    const poll = async () => {
+      try {
+        const data = await load();
+        if (stopped) return;
+        if (isActive(data.status)) timer = setTimeout(poll, 2000);
         else onChange?.();
       } catch (err) {
-        if (!cancelled) setError(err.message);
+        if (!stopped) setError(err.message);
       }
     };
+
+    const finish = async () => {
+      try {
+        await load();
+        if (!stopped) onChange?.();
+      } catch (err) {
+        if (!stopped) setError(err.message);
+      }
+    };
+
+    const listen = (seen) => {
+      stream = new EventSource(api.eventsUrl(jobId, seen));
+      stream.addEventListener("stage", (message) => {
+        const event = JSON.parse(message.data);
+        setJob((prev) => (prev ? { ...prev, events: [...prev.events, event] } : prev));
+      });
+      stream.addEventListener("end", () => {
+        stream.close();
+        if (!stopped) finish();
+      });
+      stream.onerror = () => {
+        stream.close();
+        if (!stopped) poll();
+      };
+    };
+
     setJob(null);
-    load();
+    setError(null);
+    (async () => {
+      try {
+        const data = await load();
+        if (stopped) return;
+        if (isActive(data.status)) listen(data.events.length);
+        else onChange?.();
+      } catch (err) {
+        if (!stopped) setError(err.message);
+      }
+    })();
+
     return () => {
-      cancelled = true;
+      stopped = true;
       clearTimeout(timer);
+      stream?.close();
     };
   }, [jobId, onChange]);
 
-  if (error) return <div className="alert error">{error}</div>;
+  const act = async (kind) => {
+    setBusy(kind);
+    setError(null);
+    try {
+      if (kind === "cancel") {
+        await api.cancelJob(job.id);
+        setJob(await api.getJob(job.id));
+      } else {
+        const next = await api.retryJob(job.id);
+        onOpen?.(next.id);
+      }
+      onChange?.();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  if (error && !job) return <div className="alert error">{error}</div>;
   if (!job) return <div className="panel muted">Loading…</div>;
 
   const compliance = job.compliance;
@@ -73,11 +142,12 @@ export default function JobDetail({ jobId, onChange }) {
         <div className="job-header">
           <div>
             <h2 className="break" title={decodeURIComponent(job.url)}>
-              {isDocument(job.url) ? sourceLabel(job.url) : job.url}
+              {job.url}
+              <CopyButton value={job.url} label="Copy link" title="Copy the page address" />
             </h2>
             <p className="muted small">
               Job {job.id.slice(0, 8)} · created {formatTime(job.created_at)}
-              {job.updated_at && ` · updated ${formatTime(job.updated_at)} from a re-upload`}
+              {job.updated_at && ` · updated ${formatTime(job.updated_at)} from a re-scrape`}
               {job.fetch_method && ` · fetched via ${job.fetch_method}`}
             </p>
             {keywords.length > 0 && (
@@ -93,17 +163,35 @@ export default function JobDetail({ jobId, onChange }) {
           </div>
           <StatusBadge status={job.status} />
         </div>
-        {job.error && <div className={`alert ${job.status === "blocked" ? "warn" : "error"}`}>{job.error}</div>}
-        {done && (
-          <div className="downloads">
-            <span className="muted small">Download report:</span>
-            {["json", "csv", "pdf"].map((fmt) => (
-              <a key={fmt} className="button secondary" href={api.reportUrl(job.id, fmt)}>
-                {fmt.toUpperCase()}
-              </a>
-            ))}
-          </div>
+        {job.error && (
+          <div className={`alert ${job.status === "failed" ? "error" : "warn"}`}>{job.error}</div>
         )}
+        {error && <div className="alert error">{error}</div>}
+        <div className="job-actions">
+          {active ? (
+            <button type="button" className="secondary" disabled={busy} onClick={() => act("cancel")}>
+              {busy === "cancel" ? "Stopping…" : "Cancel job"}
+            </button>
+          ) : job.retryable ? (
+            <button type="button" className="secondary" disabled={busy} onClick={() => act("retry")}>
+              {busy === "retry" ? "Starting…" : done ? "Scrape again" : "Retry"}
+            </button>
+          ) : (
+            <span className="muted small">
+              Made by an earlier version of the app, so it cannot be run again.
+            </span>
+          )}
+          {done && (
+            <>
+              <span className="muted small">Download report:</span>
+              {["csv", "pdf"].map((fmt) => (
+                <a key={fmt} className="button secondary" href={api.reportUrl(job.id, fmt)}>
+                  {fmt.toUpperCase()}
+                </a>
+              ))}
+            </>
+          )}
+        </div>
       </section>
 
       {keywords.length > 0 && (done || findings.length > 0) && (
@@ -114,7 +202,7 @@ export default function JobDetail({ jobId, onChange }) {
       )}
 
       {job.page_report && (
-        <PageReport report={job.page_report} rag={job.rag} isDocument={isDocument(job.url)} />
+        <PageReport report={job.page_report} />
       )}
 
       {(done || others.length > 0) && (

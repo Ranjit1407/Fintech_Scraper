@@ -4,7 +4,6 @@ import asyncio
 import logging
 from dataclasses import asdict
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
@@ -18,22 +17,18 @@ from app.ai.rag import RagIndex, build_index, load_rag_config, source_length, sp
 from app.ai.summarization import REPORT_QUESTIONS, part_notes, report_context, summarize_page
 from app.ai.webpage_understanding import understand_page
 from app.compliance.checker import ComplianceOutcome, run_compliance_checks
-from app.compliance.pii import check_pii, get_pii_detector
+from app.compliance.pii import get_pii_detector
 from app.config import Settings, get_settings
 from app.database.database import SessionLocal
 from app.database.models import DocumentChunk, ExtractionResult, Item, ItemReference, ScrapeJob, Source
-from app.documents.loader import load_document
 from app.scraper.browser_scraper import BrowserUnavailable, fetch_rendered, needs_browser
 from app.scraper.http_scraper import FetchResult, HttpScraper
-from app.scraper.parser import ParsedPage, _table_lines, parse_html, parse_json_payload
+from app.scraper.parser import ParsedPage, parse_html, parse_json_payload
 from app.validation.grounding import PageEvidence, ground_item, ground_report
 from app.validation.merge import merge_item, merge_reports
 from app.validation.schemas import (
-    CheckStatus,
-    ComplianceCheck,
     ComplianceReport,
     DataType,
-    DocumentJobRequest,
     ExtractedItem,
     JobStatus,
     PageReport,
@@ -48,6 +43,12 @@ log = logging.getLogger(__name__)
 ScraperFactory = Callable[[Settings], HttpScraper]
 LLMFactory = Callable[[Settings], LLMClient]
 
+CANCEL_MESSAGE = "Cancelled at your request"
+
+
+class JobCancelled(Exception):
+    """The job's row was set to 'cancelled' by the API while the pipeline was running."""
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -58,6 +59,12 @@ def _event(db: Session, job: ScrapeJob, stage: str, message: str, level: str = "
     db.commit()
     log_level = {"error": logging.ERROR, "warn": logging.WARNING}.get(level, logging.INFO)
     log.log(log_level, "[job %s] %s: %s", job.id[:8], stage, message)
+
+
+def _stop_requested(db: Session, job: ScrapeJob) -> bool:
+    # The cancel endpoint writes from its own session, so re-read the column we care about.
+    db.refresh(job, ["status"])
+    return job.status == JobStatus.CANCELLED.value
 
 
 async def run_job(
@@ -74,18 +81,23 @@ async def run_job(
         if job is None:
             log.error("Job %s not found", job_id)
             return
+        if job.status == JobStatus.CANCELLED.value:
+            log.info("Job %s was cancelled before it started", job_id)
+            return
         request = job.request or {}
         llm = llm_factory(settings) if llm_factory else LLMClient(settings, profile=request.get("llm_profile"))
         job.status = JobStatus.RUNNING.value
         job.started_at = _now()
         db.commit()
         try:
-            if request.get("source") == "document":
-                await _execute_document(db, job, llm, settings)
-            else:
-                factory = scraper_factory or HttpScraper
-                async with factory(settings) as scraper:
-                    await _execute(db, job, scraper, llm, settings)
+            factory = scraper_factory or HttpScraper
+            async with factory(settings) as scraper:
+                await _execute(db, job, scraper, llm, settings)
+        except JobCancelled:
+            db.rollback()  # discard the stage that was in flight; keep what earlier stages committed
+            job.status = JobStatus.CANCELLED.value
+            job.error = job.error or CANCEL_MESSAGE
+            _event(db, job, "cancelled", "Stopped before finishing", level="warn")
         except Exception as exc:
             log.exception("Job %s failed", job_id)
             db.rollback()
@@ -113,6 +125,8 @@ async def _execute(db: Session, job: ScrapeJob, scraper: HttpScraper, llm: LLMCl
 
     def emit(stage: str, message: str, level: str = "info") -> None:
         _event(db, job, stage, message, level)
+        if _stop_requested(db, job):
+            raise JobCancelled
 
     emit("compliance", "Running governance checks")
     outcome = await run_compliance_checks(
@@ -147,38 +161,6 @@ async def _execute(db: Session, job: ScrapeJob, scraper: HttpScraper, llm: LLMCl
                      f"text blocks")
     await _process(db, job, source, page, fetched.final_url, set(request.data_types), request.keywords,
                    llm, settings, emit)
-
-
-async def _execute_document(db: Session, job: ScrapeJob, llm: LLMClient, settings: Settings) -> None:
-    # robots.txt and terms don't apply to a local document, but personal data is still checked and redacted.
-    request = DocumentJobRequest.model_validate(job.request)
-    path = Path(request.document_path)
-
-    def emit(stage: str, message: str, level: str = "info") -> None:
-        _event(db, job, stage, message, level)
-
-    emit("document", f"Loading {path.name}")
-    page = await asyncio.to_thread(load_document, path, settings.max_document_bytes)
-    job.fetch_method = "document"
-    emit("extraction", f"{len(page.blocks)} text blocks, {len(page.tables)} tables, "
-                       f"{len(page.figures)} figures from {page.metadata.get('file_type', '').upper()} file")
-
-    pii = await asyncio.to_thread(check_pii, page.text + "\n" + _table_lines(page.tables), get_pii_detector(),
-                                  settings.pii_block_threshold)
-    local = ComplianceCheck(name="local_document", status=CheckStatus.PASS,
-                            summary="User-supplied document; website robots.txt and terms checks do not apply",
-                            details={"path": str(path)})
-    report = ComplianceReport(url=page.url, allowed=pii.status != CheckStatus.FAIL, checks=[local, pii])
-    job.compliance = report.model_dump(mode="json")
-    source = _get_or_create_source(db, page.url)
-    job.source = source
-    _report_checks(report, emit)
-    if not report.allowed:
-        job.status = JobStatus.BLOCKED.value
-        job.error = "; ".join(report.blocked_reasons)[:2000]
-        emit("compliance", "BLOCKED — document not processed", "error")
-        return
-    await _process(db, job, source, page, page.url, set(request.data_types), request.keywords, llm, settings, emit)
 
 
 async def _process(
@@ -295,8 +277,8 @@ async def _process(
     elif llm.enabled:
         emit("report", "LLM report failed; stored a basic extractive summary instead", "warn")
     else:
-        emit("report", "LLM not configured (choose a profile in config/llm.toml and set its API key in .env); "
-                       "stored a basic extractive summary instead", "warn")
+        emit("report", "LLM not configured — set OPENROUTER_API_KEY in .env and choose a profile "
+                       "(e.g. gemma-4-26b-moe) in config/llm.toml; stored a basic extractive summary instead", "warn")
 
     source.last_scraped_at = _now()
     job.status = JobStatus.COMPLETED.value

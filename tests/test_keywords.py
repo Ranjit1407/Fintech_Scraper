@@ -2,7 +2,7 @@ import asyncio
 
 from app.ai.keywords import find_passages, keyword_pattern, tag_items
 from app.ai.rag import RagConfig
-from app.documents.loader import load_document
+from app.scraper.parser import parse_html
 from app.validation.schemas import ExtractedItem
 
 TFIDF = RagConfig(embedding_provider="tfidf")
@@ -27,15 +27,15 @@ def test_items_that_mention_a_keyword_come_first():
     assert all(i.matched_keywords == [] for i in untagged)
 
 
-def test_exact_and_related_passages(tmp_path):
-    path = tmp_path / "guide.md"
-    path.write_text(
-        "# Store guide\n\n## Returns\n\nOur refund policy gives you 30 days to return any item.\n\n"
-        "## Shipping\n\nOrders ship within two days. Express shipping costs $9.\n\n"
-        "## Policy on returns for sale items\n\nSale items can be exchanged but not returned.\n",
-        encoding="utf-8",
+def test_exact_and_related_passages():
+    page = parse_html(
+        "<html><body><h1>Store guide</h1>"
+        "<h2>Returns</h2><p>Our refund policy gives you 30 days to return any item.</p>"
+        "<h2>Shipping</h2><p>Orders ship within two days. Express shipping costs $9.</p>"
+        "<h2>Policy on returns for sale items</h2><p>Sale items can be exchanged but not returned.</p>"
+        "</body></html>",
+        "https://store.example/guide",
     )
-    page = load_document(path)
     found = asyncio.run(find_passages(page, ["refund policy", "express shipping", "gift cards"], TFIDF))
 
     refund = found["refund policy"]
@@ -45,9 +45,3 @@ def test_exact_and_related_passages(tmp_path):
     assert found["gift cards"] == []
 
 
-def test_sample_document_keywords():
-    from app.config import PROJECT_ROOT
-
-    page = load_document(PROJECT_ROOT / "sample_docs" / "northwind-cd-rates.md")
-    found = asyncio.run(find_passages(page, ["early withdrawal penalty"], TFIDF))
-    assert found["early withdrawal penalty"] and found["early withdrawal penalty"][0].match == "exact"

@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, isActive } from "./api";
 import JobDetail from "./components/JobDetail";
-import JobList from "./components/JobList";
+import JobList, { statusesFor } from "./components/JobList";
 import NewJobForm from "./components/NewJobForm";
 import StatsBar from "./components/StatsBar";
 
@@ -15,29 +15,38 @@ export default function App() {
   const [jobs, setJobs] = useState([]);
   const [stats, setStats] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
+  const [filter, setFilter] = useState("all");
   const [error, setError] = useState(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [jobList, statData] = await Promise.all([api.listJobs(), api.stats()]);
+      const [jobList, statData] = await Promise.all([api.listJobs(statusesFor(filter)), api.stats()]);
       setJobs(jobList);
       setStats(statData);
       setError(null);
     } catch (err) {
       setError(`Cannot reach the API (is the backend running on port 8000?): ${err.message}`);
     }
-  }, []);
+  }, [filter]);
+
+  // Children get an identity that never changes, so changing the filter does not restart their polling.
+  const latest = useRef(refresh);
+  latest.current = refresh;
+  const onChange = useCallback(() => latest.current(), []);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
 
-  const anyActive = jobs.some((job) => isActive(job.status));
+  // Counted from stats as well as the list, so a filtered list still refreshes while a job runs.
+  const byStatus = stats?.jobs_by_status || {};
+  const anyActive =
+    jobs.some((job) => isActive(job.status)) || (byStatus.queued ?? 0) + (byStatus.running ?? 0) > 0;
   useEffect(() => {
     if (!anyActive) return undefined;
-    const timer = setInterval(refresh, 3000);
+    const timer = setInterval(() => latest.current(), 3000);
     return () => clearInterval(timer);
-  }, [anyActive, refresh]);
+  }, [anyActive]);
 
   const openJob = (id) => {
     setSelectedId(id);
@@ -86,11 +95,18 @@ export default function App() {
           <StatsBar stats={stats} />
           <div className="layout">
             <aside className="sidebar">
-              <JobList jobs={jobs} selectedId={selectedId} onSelect={setSelectedId} />
+              <JobList
+                jobs={jobs}
+                selectedId={selectedId}
+                onSelect={setSelectedId}
+                filter={filter}
+                onFilterChange={setFilter}
+                statusCounts={byStatus}
+              />
             </aside>
             <main className="content">
               {selectedId ? (
-                <JobDetail jobId={selectedId} onChange={refresh} />
+                <JobDetail jobId={selectedId} onChange={onChange} onOpen={openJob} />
               ) : (
                 <div className="empty panel">
                   <h2>No job selected</h2>

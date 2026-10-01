@@ -1,10 +1,9 @@
 # Web Scraper
 
-Web Scraper collects data from **any website** and from **documents** (PDF, Word, text, Markdown, HTML),
-following governance rules at every step. You can give it **keywords**: results for them are shown
-first, and everything else follows below.
+Web Scraper collects data from **any website**, following governance rules at every step. You can
+give it **keywords**: results for them are shown first, and everything else follows below.
 
-For every source it:
+For every page it:
 
 1. **Runs governance checks first:** robots.txt, terms of service, rate limits, licence and personal data.
    If a site doesn't allow scraping, nothing is collected.
@@ -13,7 +12,7 @@ For every source it:
 3. **Searches for your keywords:** passages that mention each keyword (including word forms such as
    plurals), passages related in meaning, and the items that mention it.
 4. **Removes anything the source doesn't support**, so the stored data and reports contain no invented figures.
-5. **Stores the results** in a database and shows them in a web dashboard, with JSON, CSV and PDF reports.
+5. **Stores the results** in a database and shows them in a web dashboard, with CSV and PDF reports.
 
 The default LLM runs **locally with Ollama**, so no API key is needed and no data leaves your machine.
 Free hosted models on [OpenRouter](https://openrouter.ai) can be used instead.
@@ -43,28 +42,27 @@ Free hosted models on [OpenRouter](https://openrouter.ai) can be used instead.
 ## How it works
 
 ```
- Website URL (+ optional keywords)              Documents (PDF, DOCX, TXT, MD, HTML)
-     │                                                   │
-     ▼                                                   ▼
- Governance checks ──FAIL──▶ job blocked           Load document, detect headings and tables
-     │ pass                                              │
-     ▼                                                   │
- Fetch page (official API, HTTP, or browser)             │
-     │                                                   │
-     └──────────────────────┬────────────────────────────┘
-                            ▼
+ Website URL (+ optional keywords)
+     │
+     ▼
+ Governance checks ──FAIL──▶ job blocked
+     │ pass
+     ▼
+ Fetch page (official API, HTTP, or browser)
+     │
+     ▼
       Clean content → redact personal data
       → LLM: understand the page → extract items
       → grounding: drop every fact not found in the source → validate
       → tag items that mention your keywords → store
-      → search the whole source for your keywords → write the report
+      → search the whole page for your keywords → write the report
                             ▼
       Dashboard: keyword results first, then the report and all other items
-      JSON / CSV / PDF reports
+      CSV / PDF reports
 ```
 
-A source too long for one prompt is read in parts and indexed for retrieval (RAG), so the whole
-document is covered. See [Long documents](#long-documents-rag).
+A page too long for one prompt is read in parts and indexed for retrieval (RAG), so the whole
+page is covered. See [Long pages](#long-pages-rag).
 
 ---
 
@@ -110,7 +108,7 @@ cp .env.example .env
 
 ```bash
 ollama pull qwen2.5:7b     # extraction, keyword findings and the report
-ollama pull bge-m3         # embeddings for keyword search and long documents (optional, TF-IDF is used without it)
+ollama pull bge-m3         # embeddings for keyword search and long pages (optional, TF-IDF is used without it)
 ```
 
 Keep Ollama running while you use the app.
@@ -195,22 +193,17 @@ Settings are read when the backend starts. **After editing `.env`, restart the b
 
 ### Dashboard
 
-The **New job** page has two sources.
-
-**Website:** enter the address of any web page, for example `example.com/pricing`, and click **Start scrape**.
+On the **New job** page, enter the address of any web page, for example `example.com/pricing`, and
+click **Start scrape**.
 - **Run governance checks only** runs the checks without collecting anything.
-- **Options** lets you choose what to store (items, raw tables, page text, metadata), how pages
-  are rendered, and an official API endpoint if the site has one.
+- **Options** lets you choose what to store (items, raw tables, page text, metadata), which model to
+  use, how pages are rendered, and an official API endpoint if the site has one.
 
-**Document folder:** click **Choose folder** or **Choose files**, or drop files onto the page.
-1. The files are uploaded.
-2. You review what will be processed and what was skipped (unsupported, empty or duplicate files).
-3. Click **Process documents**. Each document becomes its own job; **Cancel upload** deletes the upload instead.
+The page also asks **"Do you have keywords to look for?"**. Answer **Yes** and type them, separated
+by commas, or **No** to scrape the page without keywords. See [Keywords](#keywords).
 
-For both sources the page asks **"Do you have keywords to look for?"**. Answer **Yes** and type
-them, separated by commas, or **No** to process the source without keywords. See [Keywords](#keywords).
-
-While a job runs, a progress screen shows each stage. When it finishes, the job page shows, in this order:
+While a job runs, a progress screen shows each stage as it happens, streamed live from the server, and
+**Cancel job** stops it at the next stage. When it finishes, the job page shows, in this order:
 1. **Your keywords:** what the source says about each one, the matching passages and items
    (only when you gave keywords)
 2. **Items matching your keywords**
@@ -219,16 +212,9 @@ While a job runs, a progress screen shows each stage. When it finishes, the job 
    the source did not support them
 5. **Governance checks**, page understanding and the full event log
 
-**Jobs** lists every job.
-
-**Re-uploading a document** does not create a duplicate job. A document counts as a re-upload
-if it has the same content (checked with a SHA-256 hash) or the same file name as one processed
-before. The review panel marks such files and asks before updating. When you confirm with
-**Update existing results** (or **Process and update** when new and old documents are mixed):
-- the existing job is updated
-- new items and facts are added
-- a fact with the same label takes the new value
-- nothing found earlier is removed
+**Jobs** lists every job, with chips to show only one status (Active, Completed, Failed, Blocked,
+Cancelled). **Retry** on a finished job queues the same request again and leaves the original in place;
+**Copy link** copies a page or source address.
 
 ### Command line
 
@@ -238,13 +224,12 @@ Run these commands from the project folder with the virtual environment active.
 python -m app.cli profiles                                              # list LLM profiles and whether they are usable
 python -m app.cli run --url https://books.toscrape.com/                 # scrape one web page
 python -m app.cli run --url https://books.toscrape.com/ --keywords "poetry, price"
-python -m app.cli run --docs sample_docs --keywords "penalty" --out reports
+python -m app.cli run --url https://books.toscrape.com/ --keywords "poetry" --out reports
 ```
 
 | Option | Meaning |
 | --- | --- |
-| `--url` | Web page to scrape |
-| `--docs` | Folder of documents (`--recursive` includes sub-folders) |
+| `--url` | Web page to scrape (required) |
 | `--keywords` | Comma-separated keywords; their results are printed first |
 | `--profile` | LLM profile to use for this run |
 | `--data-types` | Comma-separated subset of `items,tables,text,metadata` |
@@ -260,8 +245,6 @@ code is non-zero if any job was blocked or failed.
 The project ships with fictional, public-domain (CC0) sample data for testing. It describes a
 made-up bank, Northwind Community Bank, but the scraper itself works with any kind of content.
 
-- `sample_docs/`: a PDF, a Word document, a Markdown file and a text file. Upload this folder in
-  the dashboard, or run `python -m app.cli run --docs sample_docs`.
 - `sample_site/`: a small website. To serve it locally:
   ```bash
   python -m http.server 8080 --bind 127.0.0.1 --directory sample_site
@@ -306,7 +289,7 @@ Settings are split into two files so that secrets never sit next to ordinary set
 
 | File | Contains | Committed to git |
 | --- | --- | --- |
-| [`config/llm.toml`](config/llm.toml) | LLM profiles: model, temperature, token limits, fallbacks, RAG and embedding settings | Yes |
+| [`config/llm.toml`](config/llm.toml) | LLM profiles (model, temperature, token limits, fallbacks), provider API addresses (`[providers.*]`), RAG and embedding settings | Yes |
 | `.env` (copied from [`.env.example`](.env.example)) | API keys, database URL, environment switches | **No**, it is git-ignored |
 
 API keys are protected in four ways:
@@ -328,6 +311,11 @@ API keys are protected in four ways:
 | `rules-only` | none | — | nothing |
 
 All profiles use temperature 0 and a fixed seed, so output stays close to the source and is repeatable.
+
+No model names or provider addresses are built into the code. Every profile must set `model`, and each
+provider's address comes from its `[providers.<name>] base_url` entry (or the profile's own `base_url`, or
+`LLM_BASE_URL`). If one is missing, the profile is reported as unavailable with the reason. The embedding
+model is set in `[rag]`; without it, retrieval uses TF-IDF.
 
 **Which profile is used** (first match wins):
 1. `--profile` on the CLI, or `llm_profile` in an API request
@@ -351,8 +339,6 @@ Every setting is listed with its default in [`.env.example`](.env.example).
 | `USER_AGENT` | How the scraper identifies itself to websites. Include a contact address |
 | `MIN_REQUEST_INTERVAL` | Minimum seconds between requests to the same site |
 | `ALLOW_PRIVATE_HOSTS` | Allow `localhost` / private IPs, e.g. the local sample site. **Keep `false` when deployed** |
-| `DOCUMENT_ROOTS` | Folders that server-side document paths must be inside. Set this when others can reach the API |
-| `MAX_DOCUMENT_BYTES`, `MAX_DOCUMENTS_PER_FOLDER` | Upload limits (20 MB and 100 files by default) |
 | `PII_BLOCK_THRESHOLD` | Number of personal-data findings on one page that blocks the job |
 | `MIN_ITEM_CONFIDENCE` | Items below this confidence (0–1) are rejected |
 
@@ -364,7 +350,7 @@ The LLM is constrained both before and after it answers.
 
 **Before: the prompt**
 - Temperature 0 and a fixed seed.
-- The prompt says the supplied page or document is the only source, and that anything not stated must be left out, not guessed.
+- The prompt says the supplied page is the only source, and that anything not stated must be left out, not guessed.
 - The source is marked as untrusted data, so instructions hidden in it are ignored.
 
 **After: grounding** ([`app/validation/grounding.py`](app/validation/grounding.py))
@@ -375,24 +361,23 @@ The LLM is constrained both before and after it answers.
 - Report sentences, key figures and keyword findings that quote numbers not in the source are dropped.
 - Items the page's own structure shows (structured data, table rows) but the LLM missed are added back.
 
-### Long documents (RAG)
+### Long pages (RAG)
 
-A source longer than one prompt (15,000 characters by default) is never cut off:
+A page longer than one prompt (15,000 characters by default) is never cut off:
 
 1. It is split into parts that each fit one prompt. Items are extracted from every part.
 2. It is also split into section-aware chunks. The chunks are embedded with `bge-m3`, or ranked with TF-IDF if that model isn't installed.
 3. The model writes notes on every part, and the chunks most relevant to six report questions are retrieved.
 4. The report is written from the notes and the retrieved chunks, then grounded against the full text.
 
-Keyword search always covers the whole source, whatever its length.
+Keyword search always covers the whole page, whatever its length.
 
 ---
 
 ## Governance checks
 
 Websites are checked **before** any content is collected. A **fail** blocks the job. A **warn**
-is recorded and shown in the report. Uploaded documents skip the website checks but still get
-the personal-data check.
+is recorded and shown in the report.
 
 | Check | Blocks the job when |
 | --- | --- |
@@ -422,12 +407,12 @@ Full, interactive documentation: http://localhost:8000/docs.
 | --- | --- | --- |
 | `POST` | `/api/compliance/check` | Run the governance checks for a URL without collecting anything |
 | `POST` | `/api/jobs` | Scrape a website: `{"url": "...", "keywords": ["..."], "data_types": [...], "llm_profile": "..."}` |
-| `POST` | `/api/uploads` | Upload documents (multipart field `files`). Returns a batch to review |
-| `POST` | `/api/uploads/{batch_id}/process` | Process a reviewed upload: `{"keywords": ["..."]}` |
-| `DELETE` | `/api/uploads/{batch_id}` | Cancel an upload and delete its files |
-| `POST` | `/api/documents` | Process a folder on the server: `{"folder": "...", "recursive": false, "keywords": ["..."]}` |
 | `GET` | `/api/jobs` · `/api/jobs/{id}` | List jobs · job details (keyword findings are in `page_report.keyword_findings`) |
-| `GET` | `/api/jobs/{id}/report/{json\|csv\|pdf}` | Download a job report |
+| `GET` | `/api/jobs?status=failed&status=blocked` | List only these statuses; repeat `status` for several |
+| `DELETE` | `/api/jobs/{id}` | Cancel a queued or running job; a running pipeline stops at its next stage |
+| `POST` | `/api/jobs/{id}/retry` | Queue a new job with the same request; the original is left as it is |
+| `GET` | `/api/jobs/{id}/events?after=N` | Server-sent events: one `stage` event per step as it happens, then `end` |
+| `GET` | `/api/jobs/{id}/report/{csv\|pdf}` | Download a job report (the same data as JSON: `/api/jobs/{id}`) |
 | `GET` | `/api/items?type=&q=` · `/api/items/export/csv` | Search stored items · export them as CSV |
 | `GET` | `/api/llm/profiles` | LLM profiles and whether each is usable |
 | `GET` | `/api/stats` · `/api/health` | Totals · health check |
@@ -440,9 +425,9 @@ Full, interactive documentation: http://localhost:8000/docs.
 pytest
 ```
 
-The 75 tests need no network and no LLM. They cover governance checks, parsing, document loading,
-keyword search, RAG, grounding, validation, LLM configuration and re-uploads, plus full pipeline
-runs against a mocked website and the sample documents. Tests use a temporary SQLite database and
+The 65 tests need no network and no LLM. They cover governance checks, parsing, keyword search,
+RAG, grounding, validation, LLM configuration and job control (cancel, retry, status filters, the event
+stream), plus full pipeline runs against a mocked website. Tests use a temporary SQLite database and
 TF-IDF retrieval, so your data and your Ollama models are not touched.
 
 ---
@@ -458,14 +443,12 @@ webscraper/
 │   ├── config.py          Settings loaded from .env
 │   ├── compliance/        Governance checks: robots.txt, terms, rate limits, API discovery, licence, personal data
 │   ├── scraper/           HTTP and browser fetching, HTML parsing and cleaning
-│   ├── documents/         Document loaders and upload handling
 │   ├── ai/                LLM client, page understanding, item extraction, keyword search, report, RAG
-│   ├── validation/        Schemas, grounding, merging of re-uploads
+│   ├── validation/        Schemas, grounding, merging of repeat scrapes
 │   ├── database/          Database connection and tables
 │   └── reports/           CSV and PDF reports
 ├── frontend/              React dashboard (Vite)
 ├── config/llm.toml        LLM profiles (no secrets)
-├── sample_docs/           Fictional sample documents
 ├── sample_site/           Fictional sample website
 ├── tests/                 Test suite
 ├── .env.example           Template for .env
@@ -486,7 +469,6 @@ webscraper/
 | A keyword shows *"not found"* although you can see it on the page | Navigation menus, sidebars, banners and ads are removed before analysis; the keyword may only appear there |
 | PostgreSQL connection fails | Check that the database exists and URL-encode special characters in the password |
 | A job is **blocked** | Open the job: the governance table shows which check failed and why |
-| *"has no extractable text"* for a PDF | The PDF is a scanned image. Run OCR on it first |
 | OpenRouter model returns errors or is slow | Free models are rate-limited. Try again, or switch to another profile |
 
 ---
@@ -504,7 +486,6 @@ celery -A app.worker worker --loglevel=info      # on Windows add --pool=solo
 - Use PostgreSQL.
 - Supply secrets as environment variables.
 - Keep `ALLOW_PRIVATE_HOSTS=false`.
-- Set `DOCUMENT_ROOTS`.
 - Serve the built dashboard (`npm run build`) from the API or a static host.
 - Use migrations (e.g. Alembic) for schema changes instead of automatic table creation.
 
@@ -516,7 +497,6 @@ celery -A app.worker worker --loglevel=info      # on Windows add --pool=solo
 | --- | --- |
 | Minimise hallucinations; ground responses in the source | Temperature 0, source-only prompts, and [grounding](#how-hallucinations-are-prevented) that removes every unsupported fact |
 | Use only a sample website | [`sample_site/`](sample_site/): a fictional website, served locally or on a free static host |
-| Use only sample documents with public information | [`sample_docs/`](sample_docs/): fictional, public-domain documents |
 | Use free LLMs with different parameters | Local Ollama model plus free OpenRouter models from 2.6B to 120B parameters ([profiles](#llm-profiles)) |
 | Externalise LLM configuration and API keys in a secure file | Parameters in `config/llm.toml`; keys only in the git-ignored `.env`, masked in logs, and rejected if placed in the config file |
-| CLI or UI for a website URL and a document folder | Web dashboard (Website / Document folder, with an optional keyword question) and `python -m app.cli run --url … --docs … --keywords …` |
+| CLI or UI for a website URL | Web dashboard (with an optional keyword question) and `python -m app.cli run --url … --keywords …` |

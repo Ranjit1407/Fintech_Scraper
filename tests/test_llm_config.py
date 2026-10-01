@@ -4,11 +4,13 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 
 from app.ai.llm_client import (
+    SUPPORTED_PROVIDERS,
     LLMClient,
     LLMConfigError,
     list_llm_profiles,
     llm_status,
     load_llm_profiles,
+    load_provider_urls,
     parse_json_response,
     resolve_llm_config,
 )
@@ -16,6 +18,9 @@ from app.config import PROJECT_ROOT, Settings
 
 PROFILES = """
 active_profile = "big"
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
 
 [defaults]
 temperature = 0.1
@@ -35,6 +40,13 @@ temperature = 0.0
 
 [profiles.off]
 provider = "none"
+
+[profiles.nomodel]
+provider = "openrouter"
+
+[profiles.nourl]
+provider = "openai"
+model = "vendor/model"
 """
 
 
@@ -68,8 +80,9 @@ def test_llm_needs_a_key(monkeypatch):
 
 def test_llm_uses_standard_key_variable(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    config, _ = resolve_llm_config(make_settings(llm_provider="gemini", llm_api_key=None))
-    assert config.api_key == "test-key" and config.model == "gemini-2.5-flash"
+    config, _ = resolve_llm_config(make_settings(llm_provider="gemini", llm_api_key=None, llm_model="vendor/model"))
+    assert config.api_key == "test-key" and config.model == "vendor/model"
+    assert config.base_url == load_provider_urls(PROJECT_ROOT / "config" / "llm.toml")["gemini"]
 
 
 def test_local_qwen_needs_no_key():
@@ -79,9 +92,20 @@ def test_local_qwen_needs_no_key():
 
 
 def test_ollama_needs_no_key_and_uses_native_api_root():
-    config, _ = resolve_llm_config(make_settings(llm_provider="ollama", llm_api_key=None, llm_model=None,
+    config, _ = resolve_llm_config(make_settings(llm_provider="ollama", llm_api_key=None, llm_model="local-model",
                                             llm_base_url="http://localhost:11434/v1"))
-    assert config.base_url == "http://localhost:11434" and config.model == "qwen2.5:7b"
+    assert config.base_url == "http://localhost:11434" and config.model == "local-model"
+
+
+def test_model_and_address_come_only_from_config(profile_settings, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config, reason = resolve_llm_config(profile_settings(openrouter_api_key="sk-or-test"), "nomodel")
+    assert config is None and "no model" in reason
+    config, reason = resolve_llm_config(profile_settings(), "nourl")
+    assert config is None and "[providers.openai]" in reason
+    # switching provider in .env drops the profile's model, so LLM_MODEL must be given too
+    config, reason = resolve_llm_config(profile_settings(llm_provider="openai", llm_base_url="https://example.test/v1"))
+    assert config is None and "no model" in reason
 
 
 def test_active_profile_supplies_model_and_parameters(profile_settings):
@@ -140,6 +164,9 @@ def test_shipped_config_is_valid():
     assert active in profiles
     assert all(p.provider in ("openrouter", "ollama", "none") for p in profiles.values())
     assert all(p.model.endswith(":free") for p in profiles.values() if p.provider == "openrouter")
+    urls = load_provider_urls(PROJECT_ROOT / "config" / "llm.toml")
+    assert set(urls) == set(SUPPORTED_PROVIDERS)
+    assert all(p.model and p.provider in urls for p in profiles.values() if p.provider != "none")
 
 
 def test_parse_json_response_handles_fences():

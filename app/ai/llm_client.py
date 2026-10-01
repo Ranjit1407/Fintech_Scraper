@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -16,13 +17,8 @@ from app.config import Settings, get_settings
 
 log = logging.getLogger(__name__)
 
-PROVIDER_DEFAULTS: dict[str, tuple[str, str]] = {
-    "openrouter": ("https://openrouter.ai/api/v1", "google/gemma-4-31b-it:free"),
-    "openai": ("https://api.openai.com/v1", "gpt-4.1-mini"),
-    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-2.5-flash"),
-    "qwen": ("https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
-    "ollama": ("http://localhost:11434", "qwen2.5:7b"),
-}
+# Provider addresses and models live in config/llm.toml ([providers.*] and [profiles.*]), not here.
+SUPPORTED_PROVIDERS = ("openrouter", "openai", "gemini", "qwen", "ollama")
 LOCAL_PROVIDERS = {"ollama"}  # no API key needed
 # Checked when LLM_API_KEY is not set
 PROVIDER_KEY_ENV: dict[str, tuple[str, ...]] = {
@@ -33,6 +29,7 @@ PROVIDER_KEY_ENV: dict[str, tuple[str, ...]] = {
 }
 _SECRET_KEY_RE = re.compile(r"(?:^|[_-])(?:api[_-]?key|access[_-]?key|secret|password|token)$", re.IGNORECASE)
 _SECRET_VALUE_RE = re.compile(r"^(?:sk-|sk_|AIza)[A-Za-z0-9_-]{16,}")  # OpenRouter/OpenAI, Google
+_RATE_LIMIT_DELAYS = (10, 30, 60)  # seconds to wait before retrying a rate-limited (HTTP 429) image request
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
 
@@ -70,13 +67,32 @@ def _reject_secrets(data: dict[str, Any], file: Path, prefix: str = "") -> None:
             _reject_secrets(value, file, f"{prefix}{key}.")
 
 
-def load_llm_profiles(path: str | Path) -> tuple[dict[str, LLMProfile], str | None]:
-    file = Path(path)
+def _load_config_file(file: Path) -> dict[str, Any]:
     if not file.is_file():
-        return {}, None
+        return {}
     with file.open("rb") as handle:
         data = tomllib.load(handle)
     _reject_secrets(data, file)
+    return data
+
+
+def load_provider_urls(path: str | Path) -> dict[str, str]:
+    file = Path(path)
+    urls: dict[str, str] = {}
+    for provider, values in (_load_config_file(file).get("providers") or {}).items():
+        unknown = set(values) - {"base_url"}
+        if unknown:
+            raise LLMConfigError(f"{file}: unknown setting(s) {sorted(unknown)} in [providers.{provider}]")
+        if values.get("base_url"):
+            urls[provider.strip().lower()] = str(values["base_url"])
+    return urls
+
+
+def load_llm_profiles(path: str | Path) -> tuple[dict[str, LLMProfile], str | None]:
+    file = Path(path)
+    data = _load_config_file(file)
+    if not data:
+        return {}, None
     defaults = data.get("defaults") or {}
     profiles: dict[str, LLMProfile] = {}
     for name, values in (data.get("profiles") or {}).items():
@@ -116,6 +132,7 @@ def resolve_llm_config(settings: Settings, profile_name: str | None = None) -> t
     # LLM_BASE_URL overrides only apply when no profile was chosen for the job.
     try:
         profiles, active = load_llm_profiles(settings.llm_config_file)
+        provider_urls = load_provider_urls(settings.llm_config_file)
     except (LLMConfigError, tomllib.TOMLDecodeError, TypeError) as exc:
         return None, f"invalid LLM config: {exc}"
     name = profile_name or settings.llm_profile or active
@@ -133,18 +150,23 @@ def resolve_llm_config(settings: Settings, profile_name: str | None = None) -> t
     provider = profile.provider
     if provider in ("", "none"):
         return None, f"LLM provider is 'none' (profile {profile.name!r})"
-    if provider not in PROVIDER_DEFAULTS:
-        return None, f"unknown LLM provider {provider!r} (use {', '.join(PROVIDER_DEFAULTS)} or none)"
+    if provider not in SUPPORTED_PROVIDERS:
+        return None, f"unknown LLM provider {provider!r} (use {', '.join(SUPPORTED_PROVIDERS)} or none)"
     api_key = _api_key(settings, provider)
-    base_url = base_url_override or profile.base_url
-    if provider not in LOCAL_PROVIDERS and not (api_key or base_url):
+    explicit_url = base_url_override or profile.base_url
+    if provider not in LOCAL_PROVIDERS and not (api_key or explicit_url):
         key_name = PROVIDER_KEY_ENV[provider][0]
         return None, f"provider {provider} needs an API key: set {key_name} (or LLM_API_KEY) in .env"
-    default_url, default_model = PROVIDER_DEFAULTS[provider]
-    base_url = base_url or default_url
+    base_url = explicit_url or provider_urls.get(provider)
+    if not base_url:
+        return None, (f"no address for provider {provider!r}: add [providers.{provider}] base_url "
+                      f"to {settings.llm_config_file} (or set LLM_BASE_URL)")
     if provider == "ollama":
         base_url = re.sub(r"/v1/?$", "", base_url.rstrip("/"))  # native API lives at the root
-    model = model_override or profile.model or default_model
+    model = model_override or profile.model
+    if not model:
+        return None, (f"no model set for profile {profile.name!r}: add model = \"...\" to the profile "
+                      f"in {settings.llm_config_file} (or set LLM_MODEL)")
     return LLMConfig(provider, model, base_url, api_key, profile), "configured"
 
 
@@ -263,6 +285,36 @@ class LLMClient:
             log.warning("LLM returned non-JSON output (%d chars)", len(content))
         return data
 
+    async def read_image(self, prompt: str, image: bytes, mime: str = "image/jpeg") -> str | None:
+        """Send one image with an instruction and return the model's plain-text answer (None on failure)."""
+        if not self._client:
+            return None
+        encoded = base64.b64encode(image).decode("ascii")
+        for attempt, delay in enumerate((*_RATE_LIMIT_DELAYS, None), start=1):
+            try:
+                if self.provider == "ollama":
+                    content = await self._ollama_chat(
+                        [{"role": "user", "content": prompt, "images": [encoded]}], json_mode=False)
+                else:
+                    response = await self._client.chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+                        ]}],
+                        **self._request_options(),
+                    )
+                    content = self._content(response)
+                return content.strip() or None
+            except Exception as exc:
+                if delay is not None and getattr(exc, "status_code", None) == 429:
+                    log.info("%s is rate-limited; retrying in %ds (attempt %d)", self.model_name, delay, attempt)
+                    await asyncio.sleep(delay)
+                    continue
+                log.warning("Image request to %s failed: %s", self.model_name, exc or type(exc).__name__)
+                return None
+        return None
+
     async def _openai_chat(self, messages: list[dict[str, str]]) -> str:
         options = self._request_options()
         if self._json_mode:
@@ -287,7 +339,7 @@ class LLMClient:
             log.info("Request for %s was served by fallback model %s", self.model, served_by)
         return response.choices[0].message.content or ""
 
-    async def _ollama_chat(self, messages: list[dict[str, str]]) -> str:
+    async def _ollama_chat(self, messages: list[dict[str, Any]], json_mode: bool | None = None) -> str:
         p = self.profile
         options: dict[str, Any] = {"temperature": p.temperature, "num_ctx": p.num_ctx}
         if p.top_p is not None:
@@ -297,7 +349,7 @@ class LLMClient:
         if p.seed is not None:
             options["seed"] = p.seed
         payload = {"model": self.model, "messages": messages, "stream": False, "options": options}
-        if self._json_mode:
+        if self._json_mode if json_mode is None else json_mode:
             payload["format"] = "json"
         for attempt in (1, 2):
             response = await self._client.post("/api/chat", json=payload)

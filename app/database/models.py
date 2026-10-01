@@ -66,6 +66,13 @@ class ScrapeJob(Base):
     def item_count(self) -> int:
         return len(self.items)
 
+    @property
+    def retryable(self) -> bool:
+        # Jobs saved by earlier versions (document uploads) hold a request with no web address, so there
+        # is nothing to re-run. The retry endpoint revalidates in full and stays the authority.
+        url = (self.request or {}).get("url")
+        return isinstance(url, str) and url.startswith(("http://", "https://"))
+
 
 class Item(Base):
     __tablename__ = "items"

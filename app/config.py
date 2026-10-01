@@ -43,11 +43,6 @@ class Settings(BaseSettings):
     google_api_key: SecretStr | None = None
     dashscope_api_key: SecretStr | None = None
 
-    document_roots: list[str] = []  # empty means any folder is allowed
-    max_document_bytes: int = 20_000_000
-    max_documents_per_folder: int = 100
-    upload_dir: str = str(PROJECT_ROOT / "uploads")
-
     # Keep false when deployed: otherwise the API can be used to probe internal networks.
     allow_private_hosts: bool = False
 
@@ -78,6 +73,10 @@ def setup_logging(settings: Settings | None = None) -> None:
 
     root = logging.getLogger()
     root.setLevel(settings.log_level.upper())
+
+    # Log messages carry em dashes and arrows; a cp1252 console raises on them without this.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)

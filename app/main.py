@@ -1,62 +1,73 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import AsyncIterator, Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.ai.llm_client import LLMClient, list_llm_profiles, llm_status, load_llm_profiles
 from app.compliance.checker import run_compliance_checks
 from app.config import get_settings, setup_logging
-from app.database.database import get_db, init_db
+from app.database.database import SessionLocal, get_db, init_db
 from app.database.models import Item, ScrapeJob, Source
-from app.documents.loader import SUPPORTED_EXTENSIONS, DocumentError, list_documents, resolve_folder
-from app.documents.uploads import (
-    batch_folder,
-    delete_batch,
-    describe_previous,
-    find_previous_document,
-    is_processed,
-    mark_processed,
-    read_manifest,
-    save_upload,
-)
-from app.pipeline import run_job
+from app.pipeline import CANCEL_MESSAGE, run_job
 from app.reports.csv_report import build_csv
 from app.reports.pdf_report import build_pdf
 from app.scraper.http_scraper import HttpScraper
 from app.validation.schemas import (
     ComplianceReport,
-    DataType,
-    DocumentFolderRequest,
-    DocumentJobRequest,
     ItemOut,
     JobDetail,
     JobOut,
     JobStatus,
-    ProcessUploadRequest,
     ScrapeRequest,
-    UploadBatch,
-    UploadedFile,
 )
 
 log = logging.getLogger(__name__)
 settings = get_settings()
 FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 
+ACTIVE_STATUSES = (JobStatus.QUEUED.value, JobStatus.RUNNING.value)
+STREAM_POLL_SECONDS = 1.0
+STREAM_MAX_SECONDS = 1800
+
+
+def _fail_interrupted_jobs() -> None:
+    # Without Celery a job runs inside this process, so anything still queued or running was lost
+    # when the server last stopped. Left alone it stays RUNNING forever and blocks re-uploads.
+    message = "Interrupted: the server stopped while this job was running"
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        jobs = db.scalars(select(ScrapeJob).where(ScrapeJob.status.in_(ACTIVE_STATUSES))).all()
+        for job in jobs:
+            job.status = JobStatus.FAILED.value
+            job.error = message
+            job.finished_at = job.finished_at or now
+            job.events = [*(job.events or []),
+                          {"at": now.isoformat(), "stage": "error", "level": "error", "message": message}]
+        db.commit()
+    if jobs:
+        log.warning("Marked %d interrupted job(s) as failed", len(jobs))
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     setup_logging(settings)
     init_db()
+    if not settings.use_celery:
+        _fail_interrupted_jobs()
     load_llm_profiles(settings.llm_config_file)  # fail fast on a malformed config or a key in it
     status = llm_status(settings)
     log.info("Web scraper API started (LLM: %s, Celery: %s)",
@@ -164,115 +175,16 @@ def create_job(request: ScrapeRequest, background: BackgroundTasks, db: Session 
     return job
 
 
-@app.post("/api/documents", response_model=list[JobOut], status_code=202)
-def create_document_jobs(request: DocumentFolderRequest, background: BackgroundTasks,
-                         db: Session = Depends(get_db)) -> list[ScrapeJob]:
-    """Queue one job per supported document in a folder on the machine running the API."""
-    _check_profile(request.llm_profile)
-    try:
-        folder = resolve_folder(request.folder, settings)
-    except DocumentError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
-    files = list_documents(folder, recursive=request.recursive, limit=settings.max_documents_per_folder)
-    if not files:
-        raise HTTPException(status_code=422, detail=f"No supported documents in {folder} "
-                                                    f"({', '.join(sorted(SUPPORTED_EXTENSIONS))})")
-    return _queue_documents([(path, None) for path in files], request.keywords, request.data_types,
-                            request.llm_profile, db, background)
-
-
-def _queue_documents(files: list[tuple[Path, UploadedFile | None]], keywords: list[str], data_types: list[DataType],
-                     llm_profile: str | None, db: Session, background: BackgroundTasks,
-                     updates: list[tuple[ScrapeJob, Path, UploadedFile, str]] = ()) -> list[ScrapeJob]:
-    jobs = []
-    for path, info in files:
-        job_request = DocumentJobRequest(document_path=str(path), keywords=keywords, data_types=data_types,
-                                         llm_profile=llm_profile, original_name=info.name if info else None,
-                                         file_sha256=info.sha256 if info else None)
-        job = ScrapeJob(url=path.as_uri(), request=job_request.model_dump(mode="json"),
-                        status=JobStatus.QUEUED.value, events=[])
-        db.add(job)
-        jobs.append(job)
-    now = datetime.now(timezone.utc)
-    for job, path, info, match in updates:
-        previous = job.request or {}
-        history = [*previous.get("previous_files", []), previous.get("document_path")]
-        job.request = DocumentJobRequest(
-            document_path=str(path), keywords=keywords, data_types=data_types, llm_profile=llm_profile,
-            original_name=info.name, file_sha256=info.sha256, update=True, previous_files=[h for h in history if h],
-        ).model_dump(mode="json")
-        job.url = path.as_uri()
-        job.status, job.error, job.updated_at = JobStatus.QUEUED.value, None, now
-        kind = "same content" if match == "identical" else "new version with the same name"
-        job.events = [*(job.events or []), {
-            "at": now.isoformat(), "stage": "update", "level": "info",
-            "message": f"Re-uploaded {info.name} ({kind}); new results are merged into the existing data",
-        }]
-        jobs.append(job)
-    db.commit()
-    log.info("Queued %d new and %d updated document job(s)", len(files), len(updates))
-    for job in jobs:
-        _dispatch(job.id, background)
-    return jobs
-
-
-@app.post("/api/uploads", response_model=UploadBatch, status_code=201)
-async def upload_documents(files: list[UploadFile] = File(...), db: Session = Depends(get_db)) -> UploadBatch:
-    """Store uploaded documents and flag any that were processed before. Nothing is processed yet."""
-    try:
-        batch = await save_upload(files, settings)
-    except DocumentError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
-    for file in batch.files:
-        file.previous = describe_previous(find_previous_document(db, file.sha256, file.name))
-    log.info("Upload %s: %d document(s) stored (%d processed before), %d skipped", batch.batch_id[:8],
-             len(batch.files), sum(f.previous is not None for f in batch.files), len(batch.skipped))
-    return batch
-
-
-@app.post("/api/uploads/{batch_id}/process", response_model=list[JobOut], status_code=202)
-def process_upload(batch_id: str, request: ProcessUploadRequest, background: BackgroundTasks,
-                   db: Session = Depends(get_db)) -> list[ScrapeJob]:
-    """Queue the upload: documents processed before update their existing job, the rest get new jobs."""
-    _check_profile(request.llm_profile)
-    try:
-        folder = batch_folder(batch_id, settings)
-    except DocumentError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from None
-    if is_processed(folder):
-        raise HTTPException(status_code=409, detail="These documents have already been processed")
-    manifest = {f.stored_as: f for f in read_manifest(folder)}
-    new_files: list[tuple[Path, UploadedFile | None]] = []
-    updates: list[tuple[ScrapeJob, Path, UploadedFile, str]] = []
-    for path in list_documents(folder, limit=settings.max_documents_per_folder):
-        info = manifest.get(path.name)
-        match = find_previous_document(db, info.sha256, info.name) if info and request.update_existing else None
-        if match and all(job.id != match[0].id for job, *_ in updates):
-            job, kind = match
-            if job.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value):
-                raise HTTPException(status_code=409, detail=f"{info.name} is still being processed from an earlier "
-                                                            "upload; try again when it has finished")
-            updates.append((job, path, info, kind))
-        else:
-            new_files.append((path, info))
-    mark_processed(folder)
-    return _queue_documents(new_files, request.keywords, request.data_types, request.llm_profile, db, background,
-                            updates)
-
-
-@app.delete("/api/uploads/{batch_id}", status_code=204)
-def cancel_upload(batch_id: str) -> Response:
-    try:
-        delete_batch(batch_id, settings)
-    except DocumentError as exc:
-        raise HTTPException(status_code=409 if "already" in str(exc) else 404, detail=str(exc)) from None
-    return Response(status_code=204)
-
-
 @app.get("/api/jobs", response_model=list[JobOut])
-def list_jobs(limit: int = Query(50, ge=1, le=500), db: Session = Depends(get_db)):
-    stmt = (select(ScrapeJob).options(selectinload(ScrapeJob.items))
-            .order_by(func.coalesce(ScrapeJob.updated_at, ScrapeJob.created_at).desc()).limit(limit))
+def list_jobs(
+    status: list[JobStatus] | None = Query(None, description="Keep only these statuses; repeat for several"),
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    stmt = select(ScrapeJob).options(selectinload(ScrapeJob.items))
+    if status:
+        stmt = stmt.where(ScrapeJob.status.in_([s.value for s in status]))
+    stmt = stmt.order_by(func.coalesce(ScrapeJob.updated_at, ScrapeJob.created_at).desc()).limit(limit)
     return db.scalars(stmt).all()
 
 
@@ -281,13 +193,98 @@ def get_job(job_id: str, db: Session = Depends(get_db)) -> JobDetail:
     return _job_detail(_get_job(db, job_id))
 
 
+@app.delete("/api/jobs/{job_id}", response_model=JobOut)
+def cancel_job(job_id: str, db: Session = Depends(get_db)) -> ScrapeJob:
+    """Ask a queued or running job to stop. A running pipeline stops at its next stage boundary."""
+    job = _get_job(db, job_id)
+    if job.status not in ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail=f"Job is already {job.status}; there is nothing to cancel")
+    now = datetime.now(timezone.utc)
+    job.status = JobStatus.CANCELLED.value
+    job.error = CANCEL_MESSAGE
+    job.finished_at = now
+    job.events = [*(job.events or []),
+                  {"at": now.isoformat(), "stage": "cancelled", "level": "warn",
+                   "message": "Cancel requested; the pipeline stops at the next stage"}]
+    db.commit()
+    log.info("Job %s cancelled", job_id)
+    return job
+
+
+@app.post("/api/jobs/{job_id}/retry", response_model=JobOut, status_code=202)
+def retry_job(job_id: str, background: BackgroundTasks, db: Session = Depends(get_db)) -> ScrapeJob:
+    """Queue a new job with the same request as an earlier one. The earlier job is left untouched."""
+    previous = _get_job(db, job_id)
+    if previous.status in ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail=f"Job is {previous.status}; cancel it before retrying")
+    try:
+        request = ScrapeRequest.model_validate(previous.request or {})
+    except ValidationError as exc:
+        problems = "; ".join(f"{'.'.join(str(p) for p in e['loc']) or 'request'}: {e['msg']}"
+                             for e in exc.errors()[:3])
+        hint = f" Start a new job for {previous.url} instead." if previous.retryable else ""
+        raise HTTPException(
+            status_code=422,
+            detail=f"This job cannot be re-run because its saved settings are no longer valid ({problems}).{hint}",
+        )
+    _check_profile(request.llm_profile)
+    job = ScrapeJob(url=str(request.url), request=request.model_dump(mode="json"),
+                    status=JobStatus.QUEUED.value, events=[])
+    db.add(job)
+    db.commit()
+    log.info("Job %s queued as a retry of %s", job.id, job_id)
+    _dispatch(job.id, background)
+    return job
+
+
+def _sse(name: str, payload: dict) -> str:
+    return f"event: {name}\ndata: {json.dumps(payload)}\n\n"
+
+
+def _read_progress(job_id: str) -> tuple[str, list] | None:
+    with SessionLocal() as db:
+        job = db.get(ScrapeJob, job_id)
+        return None if job is None else (job.status, list(job.events or []))
+
+
+@app.get("/api/jobs/{job_id}/events")
+async def stream_job_events(job_id: str, after: int = Query(0, ge=0)) -> StreamingResponse:
+    """Server-sent events: one `stage` event per pipeline step as it happens, then a final `end` event.
+
+    `after` is how many steps the caller already has, so a reconnecting client sees no duplicates.
+    """
+    async def stream() -> AsyncIterator[str]:
+        sent = after
+        deadline = time.monotonic() + STREAM_MAX_SECONDS
+        while True:
+            progress = await asyncio.to_thread(_read_progress, job_id)
+            if progress is None:
+                yield _sse("end", {"status": "missing"})
+                return
+            status, events = progress
+            for event in events[sent:]:
+                yield _sse("stage", event)
+            sent = max(sent, len(events))
+            if status not in ACTIVE_STATUSES:
+                yield _sse("end", {"status": status})
+                return
+            if time.monotonic() > deadline:
+                yield _sse("end", {"status": status, "timeout": True})
+                return
+            yield ": keep-alive\n\n"
+            await asyncio.sleep(STREAM_POLL_SECONDS)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/api/jobs/{job_id}/report/{fmt}")
-def job_report(job_id: str, fmt: Literal["json", "csv", "pdf"], db: Session = Depends(get_db)) -> Response:
+def job_report(job_id: str, fmt: Literal["csv", "pdf"], db: Session = Depends(get_db)) -> Response:
     job = _get_job(db, job_id)
     stem = f"scrape-report-{job.id[:8]}"
-    if fmt == "json":
-        return JSONResponse(_job_detail(job).model_dump(mode="json"),
-                            headers={"Content-Disposition": f'attachment; filename="{stem}.json"'})
     if fmt == "csv":
         return _download(build_csv(job.items), "text/csv; charset=utf-8", f"{stem}.csv")
     return _download(build_pdf(job, job.items), "application/pdf", f"{stem}.pdf")

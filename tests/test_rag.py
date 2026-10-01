@@ -1,13 +1,17 @@
 import asyncio
 import re
 
+import httpx
+
 from app.ai.extraction import merge_part_items
 from app.ai.rag import RagConfig, build_index, chunk_page, source_length, split_parts
 from app.database.database import SessionLocal, init_db
 from app.database.models import ScrapeJob
-from app.documents.loader import load_document
 from app.pipeline import run_job
-from app.validation.schemas import DocumentJobRequest
+from app.scraper.http_scraper import HttpScraper
+from app.scraper.parser import parse_html
+from app.validation.schemas import ScrapeRequest
+from tests.fixtures import ROBOTS_OK
 
 SECTIONS = 60
 FILLER = ("Saver {n} is designed for everyday savers who want easy access to their money while earning "
@@ -15,18 +19,31 @@ FILLER = ("Saver {n} is designed for everyday savers who want easy access to the
           "Interest on Saver {n} is calculated daily and paid monthly into the account or another account. ")
 
 
-def _long_document(tmp_path):
-    lines = ["# Northwind Savings Guide", ""]
+def _long_html():
+    parts = ["<h1>Northwind Savings Guide</h1>"]
     for n in range(1, SECTIONS + 1):
-        lines += [f"## Saver {n} Account", "", f"- {3 + n / 100:.2f}% APY", f"- Minimum deposit: ${n * 100}", "",
-                  FILLER.format(n=n), ""]
-    path = tmp_path / "long-guide.md"
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return path
+        parts += [f"<h2>Saver {n} Account</h2>",
+                  f"<ul><li>{3 + n / 100:.2f}% APY</li><li>Minimum deposit: ${n * 100}</li></ul>",
+                  f"<p>{FILLER.format(n=n)}</p>"]
+    return f"<html><body>{''.join(parts)}</body></html>"
 
 
-def test_parts_and_chunks_cover_the_whole_source(tmp_path):
-    page = load_document(_long_document(tmp_path))
+def _long_page():
+    return parse_html(_long_html(), "https://northwind.example/savings")
+
+
+def _long_transport():
+    pages = {"/robots.txt": (200, "text/plain", ROBOTS_OK), "/savings": (200, "text/html", _long_html())}
+
+    def handler(request):
+        status, content_type, body = pages.get(request.url.path, (404, "text/html", "<h1>Not found</h1>"))
+        return httpx.Response(status, headers={"content-type": content_type}, text=body)
+
+    return httpx.MockTransport(handler)
+
+
+def test_parts_and_chunks_cover_the_whole_source():
+    page = _long_page()
     assert source_length(page) > 15_000
     parts = split_parts(page, 15_000)
     assert len(parts) > 1
@@ -40,8 +57,8 @@ def test_parts_and_chunks_cover_the_whole_source(tmp_path):
     assert f"{3 + SECTIONS / 100:.2f}% APY" in joined and "Minimum deposit: $4000" in joined
 
 
-def test_tfidf_retrieval_finds_the_relevant_chunk(tmp_path):
-    page = load_document(_long_document(tmp_path))
+def test_tfidf_retrieval_finds_the_relevant_chunk():
+    page = _long_page()
     index = asyncio.run(build_index(page, ["Saver 37 Account minimum deposit"], RagConfig(embedding_provider="tfidf")))
     assert index.method == "tfidf"
     best = index.retrieve(top_k=1, budget_chars=10_000)
@@ -93,22 +110,25 @@ class LongDocLLM:
         pass
 
 
-def test_long_document_is_read_in_full_with_retrieval(tmp_path, monkeypatch):
+def test_long_page_is_read_in_full_with_retrieval(monkeypatch):
     import app.pipeline as pipeline
 
     monkeypatch.setattr(pipeline, "load_rag_config", lambda _settings: RagConfig(embedding_provider="tfidf"))
-    path = _long_document(tmp_path)
+    url = "https://northwind.example/savings"
     init_db()
     with SessionLocal() as db:
-        job = ScrapeJob(url=path.as_uri(), request=DocumentJobRequest(document_path=str(path)).model_dump(mode="json"),
+        job = ScrapeJob(url=url, request=ScrapeRequest(url=url).model_dump(mode="json"),
                         status="queued", events=[])
         db.add(job)
         db.commit()
         job_id = job.id
     llm = LongDocLLM()
-    asyncio.run(run_job(job_id, llm_factory=lambda _settings: llm))
+    asyncio.run(run_job(job_id, scraper_factory=lambda settings: HttpScraper(settings, transport=_long_transport()),
+                        llm_factory=lambda _settings: llm))
 
-    job = SessionLocal().get(ScrapeJob, job_id)
+    db = SessionLocal()
+    job = db.get(ScrapeJob, job_id)
+    job._test_session = db
     assert job.status == "completed", job.error
     rag = job.extraction.rag
     assert rag["parts"] > 1 and rag["chunks"] >= rag["parts"] and rag["embedding"] == "tfidf"

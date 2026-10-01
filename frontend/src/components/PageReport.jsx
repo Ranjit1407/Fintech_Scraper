@@ -85,14 +85,14 @@ function ReportDetails({ report }) {
   );
 }
 
-export default function PageReport({ report, rag, isDocument }) {
+export default function PageReport({ report }) {
   const isLlm = report.method === "llm";
   const sections = SECTIONS.filter(([key]) => report[key]?.length > 0);
 
   return (
     <section className="panel page-report">
       <div className="report-head">
-        <h3>About this {isDocument ? "document" : "page"}</h3>
+        <h3>About this page</h3>
         <span className={isLlm ? "report-source ai" : "report-source basic"}>
           {isLlm ? `AI report · ${report.model}` : "Basic summary · no LLM"}
         </span>
@@ -123,22 +123,6 @@ export default function PageReport({ report, rag, isDocument }) {
       )}
 
       <ReportDetails report={report} />
-
-      {rag && (
-        <p className="report-note small">
-          Whole {isDocument ? "document" : "page"} read: {rag.characters.toLocaleString()} characters in {rag.parts}{" "}
-          parts, {rag.chunks} chunks indexed with {rag.embedding}, and {rag.retrieved} passages retrieved for this
-          summary.
-        </p>
-      )}
-
-      {!isLlm && (
-        <p className="report-note small">
-          This summary was pieced together from text in the source, not written by an LLM. To get an AI report, keep
-          Ollama running (default <code>ollama-local</code> profile) or set <code>OPENROUTER_API_KEY</code> in{" "}
-          <code>.env</code>, then process it again.
-        </p>
-      )}
     </section>
   );
 }

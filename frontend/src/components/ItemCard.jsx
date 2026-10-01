@@ -1,4 +1,5 @@
-import { isDocument, percent, sourceLabel } from "../api";
+import { percent } from "../api";
+import CopyButton from "./CopyButton";
 
 export default function ItemCard({ item }) {
   const data = item.data || {};
@@ -51,15 +52,12 @@ export default function ItemCard({ item }) {
       {reference && (
         <footer className="source">
           <span className="muted small">Source: </span>
-          {isDocument(reference.url) ? (
-            <span title={decodeURIComponent(reference.url)}>{sourceLabel(reference.url)}</span>
-          ) : (
-            <a href={reference.url} target="_blank" rel="noreferrer">
-              {reference.url}
-            </a>
-          )}
+          <a href={reference.url} target="_blank" rel="noreferrer">
+            {reference.url}
+          </a>
+          <CopyButton value={reference.url} label="Copy link" title="Copy the source address" />
           {references.length > 1 && (
-            <span className="muted small"> · updated from {references.length} uploads</span>
+            <span className="muted small"> · updated from {references.length} scrapes</span>
           )}
           {reference.snippet && <blockquote>“{reference.snippet}”</blockquote>}
         </footer>

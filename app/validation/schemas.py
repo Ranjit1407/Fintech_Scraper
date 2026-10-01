@@ -34,6 +34,7 @@ class JobStatus(str, Enum):
     RUNNING = "running"
     BLOCKED = "blocked"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
     FAILED = "failed"
 
 
@@ -455,76 +456,6 @@ class ScrapeRequest(BaseModel):
         return _unique_data_types(value)
 
 
-class DocumentFolderRequest(BaseModel):
-    """Process every supported document (PDF, DOCX, TXT, MD, HTML) in a folder: one job per file."""
-
-    folder: str = Field(min_length=1, description="Folder path on the machine running the API")
-    recursive: bool = False
-    keywords: Keywords = Field(default_factory=list, description=KEYWORDS_DESCRIPTION)
-    data_types: DataTypes
-    llm_profile: str | None = None
-
-    @field_validator("data_types")
-    @classmethod
-    def _data_types(cls, value: list[DataType]) -> list[DataType]:
-        return _unique_data_types(value)
-
-
-class PreviousDocument(BaseModel):
-    """An earlier job for the same document: processing the upload updates it instead of adding a new one."""
-
-    job_id: str
-    match: Literal["identical", "same_name"]  # same content, or same file name with new content
-    status: JobStatus
-    item_count: int
-    processed_at: datetime
-
-
-class UploadedFile(BaseModel):
-    name: str  # path as chosen in the browser, e.g. "brochures/guide.pdf"
-    bytes: int
-    sha256: str | None = None
-    stored_as: str | None = None
-    previous: PreviousDocument | None = None
-
-
-class SkippedFile(BaseModel):
-    name: str
-    reason: str
-
-
-class UploadBatch(BaseModel):
-    """Documents uploaded from the dashboard, waiting for the user to confirm processing."""
-
-    batch_id: str
-    files: list[UploadedFile]
-    skipped: list[SkippedFile] = Field(default_factory=list)
-
-
-class ProcessUploadRequest(BaseModel):
-    keywords: Keywords = Field(default_factory=list, description=KEYWORDS_DESCRIPTION)
-    data_types: DataTypes
-    llm_profile: str | None = None
-    update_existing: bool = True
-
-    @field_validator("data_types")
-    @classmethod
-    def _data_types(cls, value: list[DataType]) -> list[DataType]:
-        return _unique_data_types(value)
-
-
-class DocumentJobRequest(BaseModel):
-    source: Literal["document"] = "document"
-    document_path: str
-    keywords: Keywords = Field(default_factory=list)
-    data_types: DataTypes
-    llm_profile: str | None = None
-    original_name: str | None = None
-    file_sha256: str | None = None
-    update: bool = False  # re-upload: merge into the existing results
-    previous_files: list[str] = Field(default_factory=list)
-
-
 class JobOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -538,6 +469,7 @@ class JobOut(BaseModel):
     finished_at: datetime | None = None
     updated_at: datetime | None = None
     item_count: int = 0
+    retryable: bool = True
 
 
 class ReferenceOut(BaseModel):

@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 
 const STEPS = [
-  { label: "Governance checks and reading the source", stages: ["compliance", "document", "router"] },
+  { label: "Governance checks and reading the source", stages: ["compliance", "router"] },
   { label: "Cleaning and understanding", stages: ["cleaning", "understanding"] },
-  { label: "Indexing the whole document (RAG)", stages: ["rag"] },
+  { label: "Indexing the whole page (RAG)", stages: ["rag"] },
   { label: "Extracting items from every part", stages: ["extraction"] },
   { label: "Checking facts against the source", stages: ["validation", "storage"] },
   { label: "Searching your keywords", stages: ["keywords"] },
@@ -84,7 +84,7 @@ export default function ProcessingView({ job }) {
       )}
       <p className="muted small">
         Elapsed {elapsed(parseTime(job.started_at || job.created_at), now)}. With the local model, each part of a long
-        document takes about a minute.
+        page takes about a minute.
       </p>
     </section>
   );

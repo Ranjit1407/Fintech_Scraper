@@ -98,7 +98,9 @@ def _run(llm=None, keywords=(), **transport_kwargs) -> ScrapeJob:
     ))
 
     db = SessionLocal()
-    return db.get(ScrapeJob, job_id)
+    job = db.get(ScrapeJob, job_id)
+    job._test_session = db  # the caller lazy-loads relationships; keep its session from being collected
+    return job
 
 
 def test_pipeline_completes_and_stores_items():

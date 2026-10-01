@@ -19,9 +19,9 @@ log = logging.getLogger(__name__)
 class RagConfig:
     chunk_chars: int = 1500
     top_k: int = 3
-    embedding_provider: str = "ollama"
-    embedding_model: str = "bge-m3"
-    embedding_base_url: str = "http://localhost:11434"
+    embedding_provider: str = "tfidf"
+    embedding_model: str | None = None  # set in config/llm.toml [rag]
+    embedding_base_url: str | None = None
     embedding_timeout: float = 180.0
 
 
@@ -192,7 +192,7 @@ class RagIndex:
     vectors: np.ndarray  # rows are normalised, so a dot product is cosine similarity
     query_vectors: np.ndarray
     queries: list[str]
-    method: str  # "ollama:bge-m3" or "tfidf"
+    method: str  # "ollama:<embedding model>" or "tfidf"
 
     def retrieve(self, top_k: int, budget_chars: int) -> list[Chunk]:
         """Top chunks for every query within a character budget, returned in document order."""
@@ -218,7 +218,11 @@ async def build_index(page: ParsedPage, queries: list[str], config: RagConfig) -
     texts = [f"{c.heading}\n{c.text}" if c.heading else c.text for c in chunks] + queries
     method = "tfidf"
     matrix = None
-    if config.embedding_provider == "ollama" and chunks:
+    use_ollama = config.embedding_provider == "ollama" and chunks
+    if use_ollama and not (config.embedding_model and config.embedding_base_url):
+        log.warning("[rag] embedding_model or embedding_base_url is not set in the LLM config; using TF-IDF retrieval")
+        use_ollama = False
+    if use_ollama:
         try:
             matrix = await _ollama_embed(texts, config)
             method = f"ollama:{config.embedding_model}"

@@ -1,12 +1,63 @@
 import { formatTime, sourceLabel } from "../api";
 import StatusBadge from "./StatusBadge";
 
-export default function JobList({ jobs, selectedId, onSelect, title = "Jobs" }) {
+/** Sidebar filters. Each maps to the statuses sent to GET /api/jobs; "all" sends none. */
+export const JOB_FILTERS = [
+  ["all", "All", []],
+  ["active", "Active", ["queued", "running"]],
+  ["completed", "Completed", ["completed"]],
+  ["failed", "Failed", ["failed"]],
+  ["blocked", "Blocked", ["blocked"]],
+  ["cancelled", "Cancelled", ["cancelled"]],
+];
+
+export function statusesFor(key) {
+  return JOB_FILTERS.find(([name]) => name === key)?.[2] ?? [];
+}
+
+function countFor(statuses, counts) {
+  const byStatus = counts || {};
+  const keys = statuses.length ? statuses : Object.keys(byStatus);
+  return keys.reduce((total, status) => total + (byStatus[status] || 0), 0);
+}
+
+function Filters({ filter, onFilterChange, counts }) {
+  return (
+    <div className="job-filters" role="group" aria-label="Filter jobs by status">
+      {JOB_FILTERS.map(([key, label, statuses]) => {
+        const count = countFor(statuses, counts);
+        if (count === 0 && key !== "all" && key !== filter) return null;
+        return (
+          <button
+            key={key}
+            type="button"
+            aria-pressed={filter === key}
+            className={filter === key ? "job-filter active" : "job-filter"}
+            onClick={() => onFilterChange(key)}
+          >
+            {label} <span className="job-filter-count">{count}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+export default function JobList({
+  jobs,
+  selectedId,
+  onSelect,
+  title = "Jobs",
+  filter,
+  onFilterChange,
+  statusCounts,
+}) {
   return (
     <section className="panel">
       <h2>{title}</h2>
+      {onFilterChange && <Filters filter={filter} onFilterChange={onFilterChange} counts={statusCounts} />}
       {jobs.length === 0 ? (
-        <p className="muted small">No jobs yet.</p>
+        <p className="muted small">{filter && filter !== "all" ? "No jobs with this status." : "No jobs yet."}</p>
       ) : (
         <ul className="job-list">
           {jobs.map((job) => (

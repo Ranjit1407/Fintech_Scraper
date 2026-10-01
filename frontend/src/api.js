@@ -20,20 +20,21 @@ async function request(path, options = {}) {
 
 export const api = {
   createJob: (body) => request("/api/jobs", { method: "POST", body: JSON.stringify(body) }),
-  uploadDocuments: (files) => {
-    const form = new FormData();
-    for (const file of files) form.append("files", file, file.webkitRelativePath || file.name);
-    return request("/api/uploads", { method: "POST", body: form });
-  },
-  processUpload: (batchId, body) =>
-    request(`/api/uploads/${batchId}/process`, { method: "POST", body: JSON.stringify(body) }),
-  cancelUpload: (batchId) => request(`/api/uploads/${batchId}`, { method: "DELETE" }),
   checkCompliance: (body) => request("/api/compliance/check", { method: "POST", body: JSON.stringify(body) }),
-  listJobs: () => request("/api/jobs?limit=100"),
+  listJobs: (statuses = []) => {
+    const params = new URLSearchParams({ limit: "100" });
+    statuses.forEach((status) => params.append("status", status));
+    return request(`/api/jobs?${params}`);
+  },
   getJob: (id) => request(`/api/jobs/${id}`),
+  cancelJob: (id) => request(`/api/jobs/${id}`, { method: "DELETE" }),
+  retryJob: (id) => request(`/api/jobs/${id}/retry`, { method: "POST" }),
+  llmProfiles: () => request("/api/llm/profiles"),
   stats: () => request("/api/stats"),
   health: () => request("/api/health"),
   reportUrl: (id, format) => `${BASE}/api/jobs/${id}/report/${format}`,
+  /** Live pipeline steps; `after` is how many the caller already has, so nothing arrives twice. */
+  eventsUrl: (id, after = 0) => `${BASE}/api/jobs/${id}/events?after=${after}`,
 };
 
 export const isActive = (status) => status === "queued" || status === "running";
@@ -46,10 +47,5 @@ export function formatTime(value) {
 
 export const percent = (value) => `${Math.round((value ?? 0) * 100)}%`;
 
-export const isDocument = (url) => url.startsWith("file:");
-
-/** "example.com/pricing" for web pages, "Document · guide.pdf" for local files. */
-export function sourceLabel(url) {
-  if (!isDocument(url)) return url.replace(/^https?:\/\//, "");
-  return `Document · ${decodeURIComponent(url.split("/").pop())}`;
-}
+/** "example.com/pricing" for a web page. */
+export const sourceLabel = (url) => url.replace(/^https?:\/\//, "");
