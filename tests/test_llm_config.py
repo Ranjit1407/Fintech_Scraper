@@ -169,6 +169,117 @@ def test_shipped_config_is_valid():
     assert all(p.model and p.provider in urls for p in profiles.values() if p.provider != "none")
 
 
+FALLBACK_PROFILES = """
+active_profile = "remote"
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+
+[providers.ollama]
+base_url = "http://localhost:11434"
+
+[defaults]
+fallback_profile = "local"
+
+[profiles.remote]
+provider = "openrouter"
+model = "vendor/free-model:free"
+
+[profiles.local]
+provider = "ollama"
+model = "local-model"
+"""
+
+
+class QuotaError(Exception):
+    """Shaped like the openai SDK's error for OpenRouter's free daily limit."""
+
+    status_code = 429
+
+    def __init__(self, reset_ms: int):
+        super().__init__("Rate limit exceeded: free-models-per-day")
+        self.body = {"message": "Rate limit exceeded", "code": 429,
+                     "metadata": {"headers": {"X-RateLimit-Limit": "50", "X-RateLimit-Reset": str(reset_ms)}}}
+
+
+@pytest.fixture
+def fallback_settings(tmp_path, monkeypatch):
+    import app.ai.llm_client as llm_client
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setattr(llm_client, "_unavailable_until", {})
+    config = tmp_path / "llm.toml"
+    config.write_text(FALLBACK_PROFILES, encoding="utf-8")
+    return make_settings(llm_config_file=str(config), openrouter_api_key="sk-or-test")
+
+
+def test_out_of_quota_model_falls_back_to_local(fallback_settings):
+    import time
+
+    reset_ms = int((time.time() + 3600) * 1000)
+    client = LLMClient(fallback_settings)
+    remote_calls, local_calls = [], []
+
+    async def remote(messages):
+        remote_calls.append(messages)
+        raise QuotaError(reset_ms)
+
+    async def local(messages, json_mode=None):
+        local_calls.append(messages)
+        return '{"answer": "from the local model"}'
+
+    client._openai_chat = remote
+    client._ollama_chat = local
+
+    async def run():
+        first = await client.complete_json("system", "first")
+        second = await client.complete_json("system", "second")
+        await client.aclose()
+        return first, second
+
+    first, second = asyncio.run(run())
+    # the failed request is retried locally, and later requests skip the remote model
+    assert first == second == {"answer": "from the local model"}
+    assert len(remote_calls) == 1 and len(local_calls) == 2
+    assert client.model_name == "ollama:local-model"
+    assert "openrouter:vendor/free-model:free is unavailable (HTTP 429)" in client.fallback_reason
+
+    # a new job starts on the local model straight away until the provider's reset time
+    later = LLMClient(fallback_settings)
+    assert later.model_name == "ollama:local-model" and "unavailable until" in later.fallback_reason
+    asyncio.run(later.aclose())
+
+
+def test_failing_fallback_does_not_loop(fallback_settings):
+    client = LLMClient(fallback_settings)
+    calls = []
+
+    async def fail(messages, json_mode=None):
+        calls.append(messages)
+        raise ConnectionError("refused")
+
+    client._openai_chat = fail
+    client._ollama_chat = fail
+    assert asyncio.run(client.complete_json("system", "user")) is None
+    assert len(calls) == 2  # remote once, local once, then the caller's rule-based fallback
+    asyncio.run(client.aclose())
+
+
+def test_unknown_fallback_profile_is_rejected(tmp_path):
+    config = tmp_path / "llm.toml"
+    config.write_text('[profiles.p]\nprovider = "openrouter"\nmodel = "m:free"\nfallback_profile = "nope"\n',
+                      encoding="utf-8")
+    with pytest.raises(LLMConfigError, match="fallback_profile"):
+        load_llm_profiles(config)
+
+
+def test_shipped_config_falls_back_to_ollama():
+    profiles, _ = load_llm_profiles(PROJECT_ROOT / "config" / "llm.toml")
+    for profile in profiles.values():
+        if profile.provider == "openrouter":
+            assert profiles[profile.fallback_profile].provider == "ollama"
+
+
 def test_parse_json_response_handles_fences():
     assert parse_json_response('```json\n{"a": 1}\n```') == {"a": 1}
     assert parse_json_response('Here you go: {"a": 2} thanks') == {"a": 2}

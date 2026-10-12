@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.scraper.parser import ParsedPage, find_figures
@@ -54,6 +54,7 @@ class PageEvidence:
     segments: list[str]  # sections, table rows, JSON-LD items, title/description
     numbers: set[float]
     words: set[str]
+    vocabulary: set[str] = field(default_factory=set)  # every whole word in the source, lower-cased
 
     @classmethod
     def from_page(cls, page: ParsedPage) -> PageEvidence:
@@ -62,7 +63,8 @@ class PageEvidence:
         segments += [" | ".join(f"{k}: {v}" for k, v in row.items() if v) for t in page.tables for row in t.rows]
         segments += [json.dumps(item, ensure_ascii=False) for item in page.json_ld]
         text = "\n".join(segments)
-        return cls(segments=segments, numbers=numbers_in(text), words=_words(text))
+        return cls(segments=segments, numbers=numbers_in(text), words=_words(text),
+                   vocabulary=set(re.findall(r"[a-z0-9]+", text.lower())))
 
     def context_for(self, name: str) -> str | None:
         exact = name.lower().strip()
@@ -118,14 +120,40 @@ def ground_item(item: dict[str, Any], evidence: PageEvidence) -> dict[str, Any]:
 
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+_CAPITALISED = re.compile(r"\b[A-Z][A-Za-z]*(?:['’&.-][A-Za-z]+)*\b")
+
+
+def _names(text: str) -> set[str]:
+    """Words of capitalised terms (people, places, organisations, products), lower-cased.
+
+    A capital after the start of a sentence is just grammar, so those words are skipped.
+    """
+    found = set()
+    for match in _CAPITALISED.finditer(text):
+        before = text[: match.start()].rstrip(" \t\"'“‘([*•–—-")
+        if not before or before.endswith((".", "!", "?", "\n")):
+            continue
+        found |= {w for w in re.findall(r"[a-z]+", match.group().lower()) if len(w) > 1}
+    return found
 
 
 def _supported(text: str, evidence: PageEvidence) -> bool:
-    return all(_contains(evidence.numbers, f.value) or f.value == 0 for f in find_figures(text))
+    """Every number and every name in a report line must appear somewhere in the source.
+
+    This catches what a model adds from memory or makes up: figures it calculated, rounded or
+    converted, and people, places or organisations the source never mentions.
+    """
+    if not all(n == 0 or _contains(evidence.numbers, n) for n in numbers_in(text)):
+        return False
+    return not evidence.vocabulary or _names(text) <= evidence.vocabulary
 
 
 def ground_report(report: PageReport, evidence: PageEvidence) -> tuple[PageReport, int]:
-    """Report text isn't tied to one item, so a number only has to appear anywhere in the source."""
+    """Report text isn't tied to one item, so its numbers and names only have to appear anywhere in the source.
+
+    Unsupported sentences are removed; a headline or overview that loses everything comes back empty for
+    the caller to replace with the extractive one. data_gaps is left alone: it lists what the source lacks.
+    """
     removed = 0
 
     def keep(items: list, text_of=lambda item: item) -> list:
@@ -146,13 +174,19 @@ def ground_report(report: PageReport, evidence: PageEvidence) -> tuple[PageRepor
         key: keep(getattr(report, key)) for key in ("key_points", "items_overview", "things_to_watch")
     }
     updates["detailed_summary"] = keep_sentences(report.detailed_summary)
+    updates["overview"] = keep_sentences(report.overview)
+    updates["headline"] = report.headline if _supported(report.headline, evidence) else ""
+    updates["audience"] = report.audience if report.audience and _supported(report.audience, evidence) else None
+    removed += (report.headline != updates["headline"]) + (report.audience != updates["audience"])
     sections = []
     for section in report.sections:
         summary = keep_sentences(section.summary)
         if summary:
             sections.append(section.model_copy(update={"summary": summary}))
     updates["sections"] = sections
-    figures = [f for f in report.key_figures if all(_contains(evidence.numbers, n) for n in numbers_in(f.value))]
+    figures = [f for f in report.key_figures
+               if all(_contains(evidence.numbers, n) for n in numbers_in(f.value))
+               and _supported(f"{f.label}. {f.context or ''}", evidence)]
     removed += len(report.key_figures) - len(figures)
     updates["key_figures"] = figures
     updates["part_notes"] = [keep(notes) for notes in report.part_notes]

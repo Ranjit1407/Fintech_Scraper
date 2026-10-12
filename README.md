@@ -1,4 +1,5 @@
-# Web Scraper
+cd A:\WebScraping\webscraper
+git status# Web Scraper
 
 Web Scraper collects data from **any website**, following governance rules at every step. You can
 give it **keywords**: results for them are shown first, and everything else follows below.
@@ -91,7 +92,6 @@ shown first and **macOS / Linux** second.
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-copy .env.example .env
 ```
 
 ```bash
@@ -99,8 +99,10 @@ copy .env.example .env
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
 ```
+
+Settings such as API keys go in a file named `.env` in the project folder. It is optional: any setting
+you leave out uses its default (see [Main `.env` settings](#main-env-settings)).
 
 ### 2. Choose an LLM
 
@@ -290,7 +292,7 @@ Settings are split into two files so that secrets never sit next to ordinary set
 | File | Contains | Committed to git |
 | --- | --- | --- |
 | [`config/llm.toml`](config/llm.toml) | LLM profiles (model, temperature, token limits, fallbacks), provider API addresses (`[providers.*]`), RAG and embedding settings | Yes |
-| `.env` (copied from [`.env.example`](.env.example)) | API keys, database URL, environment switches | **No**, it is git-ignored |
+| `.env` (you create it in the project folder) | API keys, database URL, environment switches | **No**, it is git-ignored |
 
 API keys are protected in four ways:
 - They are loaded as masked secrets, so they never appear in logs.
@@ -329,7 +331,8 @@ https://openrouter.ai/models?max_price=0; choose one that supports `response_for
 
 ### Main `.env` settings
 
-Every setting is listed with its default in [`.env.example`](.env.example).
+Every setting is listed with its default in [`app/config.py`](app/config.py). Write the names in
+capitals in `.env`, for example `MIN_REQUEST_INTERVAL=2`.
 
 | Setting | Purpose |
 | --- | --- |
@@ -451,7 +454,6 @@ webscraper/
 ├── config/llm.toml        LLM profiles (no secrets)
 ├── sample_site/           Fictional sample website
 ├── tests/                 Test suite
-├── .env.example           Template for .env
 └── requirements.txt       Python dependencies
 ```
 

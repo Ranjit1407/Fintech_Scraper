@@ -14,7 +14,7 @@ from app.ai.extraction import extract_items, merge_part_items, same_item
 from app.ai.keywords import keyword_findings, tag_items
 from app.ai.llm_client import LLMClient
 from app.ai.rag import RagIndex, build_index, load_rag_config, source_length, split_parts
-from app.ai.summarization import REPORT_QUESTIONS, part_notes, report_context, summarize_page
+from app.ai.summarization import REPORT_QUESTIONS, basic_page_report, part_notes, report_context, summarize_page
 from app.ai.webpage_understanding import understand_page
 from app.compliance.checker import ComplianceOutcome, run_compliance_checks
 from app.compliance.pii import get_pii_detector
@@ -263,6 +263,10 @@ async def _process(
     report = await summarize_page(page, understanding, valid, llm, max_chars, content=content)
     report = report.model_copy(update={"part_notes": notes, "keyword_findings": findings})
     report, dropped = ground_report(report, evidence)
+    if not report.headline or not report.overview:  # every sentence of it was unsupported
+        basic = basic_page_report(page, understanding, valid)
+        report = report.model_copy(update={"headline": report.headline or basic.headline,
+                                           "overview": report.overview or basic.overview})
     words = len(report.detailed_summary.split())
     emit("report", f"Detailed information: {len(report.sections)} section(s), {len(report.key_figures)} key "
                    f"figure(s), {words}-word detailed summary")
@@ -272,6 +276,7 @@ async def _process(
         report = merge_reports(PageReport.model_validate(previous_report), report)
         emit("report", "Merged the new report with the earlier findings for this document")
     job.extraction.page_report = report.model_dump(mode="json")
+    job.extraction.llm_model = llm.model_name  # the fallback model, if the job switched to it
     if report.method == "llm":
         emit("report", f"Report written by {report.model}: {report.headline}")
     elif llm.enabled:

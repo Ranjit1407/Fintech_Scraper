@@ -6,8 +6,10 @@ import json
 import logging
 import os
 import re
+import time
 import tomllib
 from dataclasses import dataclass, field, fields, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,13 @@ _SECRET_VALUE_RE = re.compile(r"^(?:sk-|sk_|AIza)[A-Za-z0-9_-]{16,}")  # OpenRou
 _RATE_LIMIT_DELAYS = (10, 30, 60)  # seconds to wait before retrying a rate-limited (HTTP 429) image request
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
+# A remote model that is out of credits (402), withdrawn (404) or rate-limited (429) is skipped until the
+# provider's reset time, so later jobs go straight to the fallback profile instead of failing again.
+_SKIP_STATUSES = {402, 404, 429}
+_DEFAULT_SKIP_SECONDS = 15 * 60  # when the provider gives no reset time
+_MAX_SKIP_SECONDS = 24 * 3600
+_unavailable_until: dict[str, float] = {}  # "provider:model" -> time.time() it may be tried again
+
 
 class LLMConfigError(ValueError):
     pass
@@ -44,6 +53,7 @@ class LLMProfile:
     model: str | None = None
     base_url: str | None = None
     fallback_models: tuple[str, ...] = ()
+    fallback_profile: str | None = None  # used for the rest of a job when this remote model fails
     description: str = ""
     temperature: float = 0.0
     top_p: float | None = None
@@ -102,7 +112,11 @@ def load_llm_profiles(path: str | Path) -> tuple[dict[str, LLMProfile], str | No
             raise LLMConfigError(f"{file}: unknown setting(s) {sorted(unknown)} in profile {name!r}")
         merged["provider"] = str(merged.get("provider", "none")).strip().lower()
         merged["fallback_models"] = tuple(merged.get("fallback_models") or ())
+        merged["fallback_profile"] = merged.get("fallback_profile") or None  # "" switches it off
         profiles[name] = LLMProfile(name=name, **merged)
+    for name, profile in profiles.items():
+        if profile.fallback_profile and profile.fallback_profile not in profiles:
+            raise LLMConfigError(f"{file}: profile {name!r} has unknown fallback_profile {profile.fallback_profile!r}")
     return profiles, data.get("active_profile")
 
 
@@ -198,6 +212,33 @@ def list_llm_profiles(settings: Settings | None = None) -> dict[str, Any]:
     return {"default": settings.llm_profile or active, "profiles": items}
 
 
+def _skip_seconds(exc: Exception) -> float:
+    """Seconds until the provider's limit resets: a response header, or OpenRouter's error metadata."""
+    candidates = []
+    response = getattr(exc, "response", None)
+    if response is not None:
+        candidates.append(response.headers.get("x-ratelimit-reset"))
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        body = body["error"] if isinstance(body.get("error"), dict) else body
+        candidates.append(((body.get("metadata") or {}).get("headers") or {}).get("X-RateLimit-Reset"))
+    for value in candidates:
+        try:
+            reset = float(value)
+        except (TypeError, ValueError):
+            continue
+        if reset > 1e12:  # epoch milliseconds (OpenRouter)
+            reset /= 1000
+        wait = reset - time.time() if reset > 1e9 else reset  # epoch seconds, or seconds to wait
+        if wait > 0:
+            return min(wait, _MAX_SKIP_SECONDS)
+    return _DEFAULT_SKIP_SECONDS
+
+
+def _clock(timestamp: float) -> str:
+    return datetime.fromtimestamp(-(-timestamp // 60) * 60).strftime("%d %b %H:%M")  # next whole minute
+
+
 def parse_json_response(content: str) -> dict[str, Any] | None:
     text = _FENCE_RE.sub("", content.strip())
     try:
@@ -217,12 +258,26 @@ class LLMClient:
     """Create one per job (the underlying HTTP pool is bound to the running event loop)."""
 
     def __init__(self, settings: Settings | None = None, profile: str | None = None):
-        settings = settings or get_settings()
+        self._settings = settings or get_settings()
         self._client: Any = None
-        config, reason = resolve_llm_config(settings, profile)
+        self._fell_back = False
+        self.fallback_reason: str | None = None  # why this job is running on the fallback profile (logged only)
+        config, reason = resolve_llm_config(self._settings, profile)
+        if config and config.provider not in LOCAL_PROVIDERS:
+            name = f"{config.provider}:{config.model}"
+            until = _unavailable_until.get(name, 0.0)
+            if until > time.time() and (fallback := self._fallback_config(config.profile)):
+                self._fell_back = True
+                self.fallback_reason = (f"{name} is unavailable until {_clock(until)}; "
+                                        f"using {fallback.provider}:{fallback.model} instead")
+                log.warning(self.fallback_reason)
+                config = fallback
+        self._configure(config, reason, profile)
+
+    def _configure(self, config: LLMConfig | None, reason: str, profile_name: str | None = None) -> None:
         self.provider = config.provider if config else None
         self.model = config.model if config else None
-        self.profile = config.profile if config else LLMProfile(name=profile or "default")
+        self.profile = config.profile if config else LLMProfile(name=profile_name or "default")
         self.max_input_chars = self.profile.max_input_chars
         self._json_mode = self.profile.json_mode
         if config is None:
@@ -272,18 +327,55 @@ class LLMClient:
         if not self._client:
             return None
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        try:
-            if self.provider == "ollama":
-                content = await self._ollama_chat(messages)
-            else:
-                content = await self._openai_chat(messages)
-        except Exception as exc:  # network, auth, quota, model not pulled, timeout...
-            log.warning("LLM request to %s failed: %s", self.model_name, exc or type(exc).__name__)
-            return None
+        while True:
+            try:
+                if self.provider == "ollama":
+                    content = await self._ollama_chat(messages)
+                else:
+                    content = await self._openai_chat(messages)
+                break
+            except Exception as exc:  # network, auth, quota, model withdrawn or not pulled, timeout...
+                log.warning("LLM request to %s failed: %s", self.model_name, exc or type(exc).__name__)
+                if not await self._fall_back(exc):
+                    return None
         data = parse_json_response(content)
         if data is None:
             log.warning("LLM returned non-JSON output (%d chars)", len(content))
         return data
+
+    def _fallback_config(self, profile: LLMProfile) -> LLMConfig | None:
+        name = profile.fallback_profile
+        if not name or name == profile.name:
+            return None
+        config, reason = resolve_llm_config(self._settings, name)
+        if config is None:
+            log.warning("Fallback profile %r is not usable: %s", name, reason)
+        return config
+
+    async def _fall_back(self, exc: Exception) -> bool:
+        """Switch the rest of this job to the fallback profile (normally the local Ollama model).
+
+        Only a remote model falls back, and only once per job, so a failing fallback cannot loop.
+        """
+        if self._fell_back or self.provider in LOCAL_PROVIDERS:
+            return False
+        fallback = self._fallback_config(self.profile)
+        if fallback is None:
+            return False
+        self._fell_back = True
+        failed = self.model_name
+        status = getattr(exc, "status_code", None)
+        if status in _SKIP_STATUSES:
+            until = time.time() + _skip_seconds(exc)
+            _unavailable_until[failed] = until
+            why = f"unavailable (HTTP {status}) until {_clock(until)}"
+        else:
+            why = f"unavailable ({f'HTTP {status}' if status else type(exc).__name__})"
+        await self.aclose()
+        self._configure(fallback, "configured")
+        self.fallback_reason = f"{failed} is {why}; switched to {self.model_name} for the rest of this job"
+        log.warning(self.fallback_reason)
+        return True
 
     async def read_image(self, prompt: str, image: bytes, mime: str = "image/jpeg") -> str | None:
         """Send one image with an instruction and return the model's plain-text answer (None on failure)."""

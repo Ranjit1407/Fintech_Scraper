@@ -49,6 +49,10 @@ json_mode = true         # ask for a JSON object; retried without it if the mode
 timeout = 180            # seconds per request (free models can queue)
 max_input_chars = 15000  # source text sent per prompt
 num_ctx = 16384          # Ollama only: context window in tokens
+# When a remote model fails (free daily limit used up, out of credits, model withdrawn, service down),
+# the rest of the job runs on this profile instead. A model that hit its limit is skipped until the
+# provider's reset time. Set fallback_profile = "" in a profile to switch this off.
+fallback_profile = "ollama-local"
 
 [profiles.gemma-4-31b]
 description = "Google Gemma 4 31B (free, OpenRouter)"
